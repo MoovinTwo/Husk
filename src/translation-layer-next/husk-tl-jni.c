@@ -49,6 +49,13 @@ struct tl_jclass {
 #define NBUCKETS 512
 static tl_jclass *g_classes[NBUCKETS];
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+/*
+ * Held while a field or an array element is read and a reference taken on what it holds, and while one is
+ * replaced, so that no other thread releases the value in between; the old value is released after it is
+ * let go. It also covers an object's fields, which grow by realloc, and a class's statics. Taken inside
+ * g_lock, never around it.
+ */
+static pthread_mutex_t g_slot_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_trace;
 static const tl_jhle *g_hle[16];
 static int g_nhle;
@@ -402,9 +409,11 @@ static tl_jfield *lookup_field(tl_jclass *cls, const char *name, const char *sig
     f = calloc(1, sizeof(*f));
     f->cls = owner; f->name = strdup(name); f->sig = strdup(sig); f->is_static = is_static;
     if (is_static) {
+        pthread_mutex_lock(&g_slot_lock);
         f->index = (uint32_t)owner->nstatics++;
         owner->statics = realloc(owner->statics, (size_t)owner->nstatics * sizeof(jvalue));
         memset(&owner->statics[owner->nstatics - 1], 0, sizeof(jvalue));
+        pthread_mutex_unlock(&g_slot_lock);
     }
     if (owner->nfields == owner->capf) { owner->capf = owner->capf ? owner->capf * 2 : 8; owner->fields = realloc(owner->fields, (size_t)owner->capf * sizeof(*owner->fields)); }
     owner->fields[owner->nfields++] = f;
@@ -440,9 +449,11 @@ static void store_value(jobj *o, tl_jfield *f, bool is_obj, jvalue v)
         if (is_obj) tl_jni_unref(v.l);
         return;
     }
+    pthread_mutex_lock(&g_slot_lock);
     jvalue *slot = field_slot(o, f, true);
     jobj *old = ref ? slot->l : NULL;
     *slot = v;
+    pthread_mutex_unlock(&g_slot_lock);
     tl_jni_unref(old);
 }
 
@@ -450,9 +461,11 @@ static void store_value(jobj *o, tl_jfield *f, bool is_obj, jvalue v)
 static jvalue load_value(jobj *o, tl_jfield *f, bool is_obj)
 {
     jvalue v; v.j = 0;
+    pthread_mutex_lock(&g_slot_lock);
     jvalue *slot = field_slot(o, f, false);
     if (slot) v = *slot;
     if (is_obj) v.l = sig_is_obj(f->sig) ? tl_jni_ref(v.l) : NULL;
+    pthread_mutex_unlock(&g_slot_lock);
     return v;
 }
 
@@ -963,13 +976,25 @@ static jo jni_NewObjectArray(void *env, int32_t len, jo cls, jo init)
     for (int32_t i = 0; init && i < len; i++) a->oarr.v[i] = tl_jni_ref(init);
     return tl_jni_local(a);
 }
-static jo jni_GetObjectArrayElement(void *env, jo a, int32_t i) { (void)env; return (a && i >= 0 && (uint32_t)i < a->oarr.len) ? tl_jni_local(tl_jni_ref(a->oarr.v[i])) : NULL; }
+static jo jni_GetObjectArrayElement(void *env, jo a, int32_t i)
+{
+    (void)env;
+    if (!a || i < 0 || (uint32_t)i >= a->oarr.len) return NULL;
+    pthread_mutex_lock(&g_slot_lock);
+    jo r = tl_jni_ref(a->oarr.v[i]);
+    pthread_mutex_unlock(&g_slot_lock);
+    return tl_jni_local(r);
+}
 static void jni_SetObjectArrayElement(void *env, jo a, int32_t i, jo v)
 {
     (void)env;
     if (!a || i < 0 || (uint32_t)i >= a->oarr.len) return;
-    tl_jni_unref(a->oarr.v[i]);
-    a->oarr.v[i] = tl_jni_ref(v);
+    tl_jni_ref(v);
+    pthread_mutex_lock(&g_slot_lock);
+    jo old = a->oarr.v[i];
+    a->oarr.v[i] = v;
+    pthread_mutex_unlock(&g_slot_lock);
+    tl_jni_unref(old);
 }
 
 #define PRIM_ARRAYS(X) \
