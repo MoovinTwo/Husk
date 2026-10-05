@@ -81,25 +81,9 @@ void *husk_tl_read_entry(const char *a, const char *b, size_t l, size_t *o)
 void *tl_find_stikdebug_prewarmed(void) { return NULL; }
 bool tl_jit_carve(size_t n, uint8_t **rx, uint8_t **rw) { (void)n; (void)rx; (void)rw; return false; }
 EOF
-# The probe also reaches into the loader for the debugger-granted (StikDebug)
-# JIT region. There is none under qemu-user, so these stubs report "no region"
-# and the dualmap check takes its skip path, as on a device without StikDebug.
-cat > "$OUT/noload.c" <<'EOF'
-#include "husk-tl-internal.h"
-tl_dual_mapping *tl_find_stikdebug_prewarmed(void) { return NULL; }
-bool tl_jit_carve(size_t bytes, uint8_t **rx, uint8_t **rw)
-{ (void)bytes; *rx = NULL; *rw = NULL; return false; }
-EOF
-# check_dualmap() calls Apple's sys_icache_invalidate() directly; give it the
-# portable equivalent so the probe builds for arm64 Linux.
-cat > "$OUT/icache.h" <<'EOF'
-#include <stddef.h>
-static inline void sys_icache_invalidate(void *p, size_t n)
-{ __builtin___clear_cache((char *)p, (char *)p + n); }
-EOF
 aarch64-linux-gnu-gcc $CFLAGS -static -o "$OUT/checks_arm64" "$HERE/scan_cli.c" \
-    "$OUT/noscan.c" "$OUT/noload.c" "$SRC"/husk-tl-json.c \
-    -include "$OUT/icache.h" "$SRC"/husk-tl-probe.c \
+    "$OUT/noscan.c" "$SRC"/husk-tl-json.c \
+    "$SRC"/husk-tl-probe.c \
     -Wl,--defsym=husk_tl_free=free -lpthread
 python3 - "$OUT/checks_arm64" "$QEMU_AARCH64" <<'EOF'
 import json, subprocess, sys
