@@ -519,7 +519,8 @@ final class GuestBridge {
         // caller compares `wc -c` against the file's real size before pm sees it.
         sequence += 1
         let token = "\(Self.marker)\(sequence):"
-        let command = "head -c \(size) > \(remote) 2>&1; echo \(token)$?\n"
+        // `remote` is a plain path, quoted here so no caller can forget to.
+        let command = "head -c \(size) > \(AndroidHost.quote(remote)) 2>&1; echo \(token)$?\n"
         try writeAll(fd, Data(command.utf8))
 
         var sent = 0
@@ -1051,7 +1052,7 @@ final class AndroidHost: ObservableObject {
                 return [:]
             }
 
-            let db = try GuestBridge.shared.pull("cat \(path)", timeout: 120)
+            let db = try GuestBridge.shared.pull("cat \(AndroidHost.quote(path))", timeout: 120)
             guard db.prefix(6) == Data("SQLite".utf8) else {
                 HuskLog.log("bridge", "\(path) is not a SQLite file (\(db.count) bytes)")
                 return [:]
@@ -1064,7 +1065,7 @@ final class AndroidHost: ObservableObject {
             // an app installed this session, most of all -- are in the sidecar
             // rather than the file itself. Brought along so SQLite can replay
             // it; harmless when there is nothing to replay.
-            if let wal = try? GuestBridge.shared.pull("cat \(path)-wal", timeout: 120),
+            if let wal = try? GuestBridge.shared.pull("cat \(AndroidHost.quote(path + "-wal"))", timeout: 120),
                wal.count > 32 {
                 try? wal.write(to: Self.support.appendingPathComponent(
                     "launcher-icons.db-wal"))
@@ -1286,10 +1287,12 @@ final class AndroidHost: ObservableObject {
         return (free: numbers[2] * 1024, total: numbers[0] * 1024)
     }
 
-    /// Single-quoted for a shell, with any quote of its own removed. A guest
-    /// filename is chosen by whoever made the file and reaches a shell verbatim.
+    /// Single-quoted for a shell. A guest filename is chosen by whoever made the
+    /// file and reaches a shell verbatim, so a quote inside it is escaped as
+    /// `'\''` (close, escaped quote, reopen) rather than dropped: dropping it
+    /// named a different file, which could exist and be the one acted on.
     nonisolated static func quote(_ path: String) -> String {
-        "'" + path.replacingOccurrences(of: "'", with: "") + "'"
+        "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     /// Ask an app what it is called and what it looks like.
@@ -1312,7 +1315,7 @@ final class AndroidHost: ObservableObject {
         if haveIcon && haveLabel { return }
 
         do {
-            let paths = try GuestBridge.shared.shell("pm path \(package)", timeout: 30)
+            let paths = try GuestBridge.shared.shell("pm path \(AndroidHost.quote(package))", timeout: 30)
             let apks = paths.split(separator: "\n")
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { $0.hasPrefix("package:") }
@@ -1481,13 +1484,12 @@ final class AndroidHost: ObservableObject {
                     let scoped = file.startAccessingSecurityScopedResource()
                     defer { if scoped { file.stopAccessingSecurityScopedResource() } }
 
-                    // Quoted and stripped of any path: a filename is chosen by
-                    // whoever made the file, and it reaches a shell verbatim.
-                    let safe = name.replacingOccurrences(of: "'", with: "")
-                    let remote = "\(directory)/\(safe)"
+                    // The last path component only, quoted wherever it reaches a
+                    // shell: a filename is chosen by whoever made the file.
+                    let remote = "\(directory)/\(name)"
                     _ = try? GuestBridge.shared.shell(
                         "mkdir -p \(Self.quote(directory))")
-                    try GuestBridge.shared.push(file, to: "'\(remote)'") { p in
+                    try GuestBridge.shared.push(file, to: remote) { p in
                         Task { @MainActor in
                             self?.busy = "Sending \(name) — \(Int(p * 100))%"
                         }
@@ -1496,7 +1498,7 @@ final class AndroidHost: ObservableObject {
                     // media database is what Android's file pickers read.
                     _ = try? GuestBridge.shared.shell(
                         "am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE "
-                      + "-d file://\(remote)", timeout: 60)
+                      + "-d \(Self.quote("file://" + remote))", timeout: 60)
                     HuskLog.log("bridge", "sent \(name) to Download")
                     sent += 1
                 } catch {
@@ -1551,7 +1553,7 @@ final class AndroidHost: ObservableObject {
     func uninstall(_ package: String) {
         busy = "Removing \(package)…"
         Task.detached { [weak self] in
-            var out = (try? GuestBridge.shared.shell("pm uninstall \(package)",
+            var out = (try? GuestBridge.shared.shell("pm uninstall \(AndroidHost.quote(package))",
                                                      timeout: 300)) ?? ""
             // As root, `pm` has no user of its own to act for, and some builds
             // answer "not installed for 0" until told which user to remove it
@@ -1561,7 +1563,7 @@ final class AndroidHost: ObservableObject {
                 HuskLog.log("bridge", "uninstall \(package) first try: "
                           + out.trimmingCharacters(in: .whitespacesAndNewlines))
                 out = (try? GuestBridge.shared.shell(
-                    "pm uninstall --user 0 \(package)", timeout: 300)) ?? out
+                    "pm uninstall --user 0 \(AndroidHost.quote(package))", timeout: 300)) ?? out
             }
             let ok = out.contains("Success")
             HuskLog.log("bridge", "uninstall \(package): "
@@ -1649,7 +1651,7 @@ final class AndroidHost: ObservableObject {
                     // "Failed to parse /data/local/tmp/husk-install.apk".
                     let size = (try FileManager.default
                         .attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue ?? 0
-                    let landed = Int(try GuestBridge.shared.shell("wc -c < \(remotes[i])")
+                    let landed = Int(try GuestBridge.shared.shell("wc -c < \(AndroidHost.quote(remotes[i]))")
                         .trimmingCharacters(in: .whitespacesAndNewlines)) ?? -1
                     guard landed == size else {
                         throw BridgeError.io("copied \(landed) of \(size) bytes "
@@ -1669,10 +1671,10 @@ final class AndroidHost: ObservableObject {
                 // install-multiple for a split set, which has to be handed over
                 // as one transaction: the base APK alone carries no native code.
                 let command = apks.count == 1
-                    ? "pm install -r -t \(remote)"
-                    : "pm install-multiple -r -t \(remotes.joined(separator: " "))"
+                    ? "pm install -r -t \(AndroidHost.quote(remote))"
+                    : "pm install-multiple -r -t \(remotes.map(AndroidHost.quote).joined(separator: " "))"
                 let out = try GuestBridge.shared.shell(command, timeout: installBudget)
-                for r in remotes { _ = try? GuestBridge.shared.shell("rm -f \(r)") }
+                for r in remotes { _ = try? GuestBridge.shared.shell("rm -f \(AndroidHost.quote(r))") }
                 let ok = out.contains("Success")
                 HuskLog.log("bridge", "install \(name): "
                           + out.trimmingCharacters(in: .whitespacesAndNewlines))
@@ -1904,7 +1906,7 @@ final class AndroidHost: ObservableObject {
         busy = "Opening…"
         Task.detached { [weak self] in
             let out = (try? GuestBridge.shared.shell(
-                "monkey -p \(pkg) -c android.intent.category.LAUNCHER 1", timeout: 60)) ?? ""
+                "monkey -p \(AndroidHost.quote(pkg)) -c android.intent.category.LAUNCHER 1", timeout: 60)) ?? ""
             HuskLog.log("bridge", "launch \(pkg): \(out.split(separator: "\n").last ?? "")")
             await MainActor.run { self?.busy = nil; then() }
         }
