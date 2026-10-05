@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 import Foundation
 
 // MARK: - Internal Model
@@ -13,7 +14,9 @@ struct SourceApp: Identifiable, Equatable {
     let bundleIdentifier: String
     let version: String
     let downloadURL: String
-    let iconURL: String
+    /// Optional: a source may not have an icon for an app, and Discover then
+    /// draws a placeholder rather than a request that can only fail.
+    let iconURL: String?
     let localizedDescription: String
     var id: String { bundleIdentifier }
 }
@@ -32,6 +35,31 @@ private struct FDroidApp: Codable {
     let description: String?
     let icon: String?
     let localized: [String: FDroidLocalized]?
+    /// The version the repository recommends: a decimal string in f-droid.org's
+    /// index-v1, so it is read leniently.
+    let suggestedVersionCode: LenientInt?
+}
+
+/// An integer that may arrive as a JSON number or as a decimal string. Repositories
+/// differ, and a strict type here would fail the whole index, not one field.
+private struct LenientInt: Codable, Equatable {
+    let value: Int?
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let number = try? container.decode(Int.self) {
+            value = number
+        } else if let text = try? container.decode(String.self) {
+            value = Int(text)
+        } else {
+            value = nil
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(value)
+    }
 }
 private struct FDroidLocalized: Codable {
     let name: String?
@@ -39,14 +67,22 @@ private struct FDroidLocalized: Codable {
     let description: String?
     let icon: String?
 }
-private struct FDroidPackage: Codable { let apkName: String; let versionName: String }
+private struct FDroidPackage: Codable {
+    let apkName: String
+    let versionName: String
+    let versionCode: LenientInt?
+    /// The ABIs the APK carries native code for; nil for a pure-Java APK.
+    let nativecode: [String]?
+}
 
 // MARK: - Husk Simple Schema
 private struct HuskSimpleSource: Codable {
     let name: String; let identifier: String; let apps: [SourceAppCodable]
 }
 private struct SourceAppCodable: Codable {
-    let name, bundleIdentifier, version, downloadURL, iconURL, localizedDescription: String
+    let name, bundleIdentifier, version, downloadURL, localizedDescription: String
+    /// Optional so that one app without an icon does not fail the whole source.
+    let iconURL: String?
 }
 
 // MARK: - Manager
@@ -118,13 +154,31 @@ final class SourceManager: ObservableObject {
                 let baseURL = fdroid.repo.address
                 var apps: [SourceApp] = []
                 for fApp in fdroid.apps {
-                    guard let pkgs = fdroid.packages[fApp.packageName], let latest = pkgs.first else { continue }
-                    let loc = fApp.localized?["en-US"] ?? fApp.localized?.values.first
+                    // The guest is arm64-only, so an APK built for other ABIs alone
+                    // cannot install. Some apps (VLC) publish one APK per ABI, and the
+                    // newest is not necessarily the arm64 one.
+                    let runnable = (fdroid.packages[fApp.packageName] ?? [])
+                        .filter { $0.nativecode?.contains("arm64-v8a") ?? true }
+                    let suggested = fApp.suggestedVersionCode?.value
+                    guard let latest = runnable.first(where: { suggested != nil && $0.versionCode?.value == suggested })
+                            ?? runnable.first else { continue }
+                    let locale = fApp.localized?["en-US"] != nil ? "en-US" : fApp.localized?.keys.sorted().first
+                    let loc = locale.flatMap { fApp.localized?[$0] }
                     let appName = fApp.name ?? loc?.name ?? fApp.packageName
                     let appSummary = fApp.summary ?? loc?.summary ?? fApp.description ?? loc?.description ?? ""
-                    let appIcon = fApp.icon ?? loc?.icon
-                    let iconURL = appIcon.map { "\(baseURL)/icons/\($0)" } ?? ""
-                    
+                    // Two places an icon can be: the repository-wide icons folder, named
+                    // by the top-level field, or the app's own per-locale metadata, which
+                    // is all that most current apps have. A localized name looked up in
+                    // icons/ is a 404.
+                    let iconURL: String?
+                    if let icon = fApp.icon {
+                        iconURL = "\(baseURL)/icons/\(icon)"
+                    } else if let locale, let icon = loc?.icon {
+                        iconURL = "\(baseURL)/\(fApp.packageName)/\(locale)/\(icon)"
+                    } else {
+                        iconURL = nil
+                    }
+
                     apps.append(SourceApp(
                         name: appName,
                         bundleIdentifier: fApp.packageName,

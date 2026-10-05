@@ -160,15 +160,28 @@ struct DiscoverTab: View {
         .cornerRadius(16)
     }
 
+    private var iconPlaceholder: some View {
+        Image(systemName: "app.dashed").font(.title).foregroundStyle(Theme.textDim)
+    }
+
     private func appRow(_ app: SourceApp) -> some View {
         HStack(spacing: 16) {
-            AsyncImage(url: URL(string: app.iconURL)) { phase in
-                if let image = phase.image {
-                    image.resizable().aspectRatio(contentMode: .fit)
-                } else if phase.error != nil {
-                    Image(systemName: "app.dashed").font(.title).foregroundStyle(Theme.textDim)
+            // An app with no icon URL gets the same placeholder as an icon that
+            // failed to load. It is drawn directly rather than by handing
+            // AsyncImage a nil URL, which would leave a spinner up instead.
+            Group {
+                if let icon = app.iconURL.flatMap(URL.init(string:)) {
+                    AsyncImage(url: icon) { phase in
+                        if let image = phase.image {
+                            image.resizable().aspectRatio(contentMode: .fit)
+                        } else if phase.error != nil {
+                            iconPlaceholder
+                        } else {
+                            ProgressView()
+                        }
+                    }
                 } else {
-                    ProgressView()
+                    iconPlaceholder
                 }
             }
             .frame(width: 50, height: 50)
