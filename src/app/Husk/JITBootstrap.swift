@@ -53,6 +53,11 @@ enum JITBootstrap {
     // 512 MiB since the native runtime runs Minecraft: its main library alone is a 354 MiB image that has to sit in this
     // region, with the stubs the loader places beside it. A larger prewarm is safe for QEMU, which is handed the
     // prewarmed region whenever it is at least what tb-size asks for.
+    //
+    // Must match HUSK_JIT_REGION_BYTES in src/ios-jit/husk-ios-jit.h and
+    // TL_JIT_REGION_BYTES in src/translation-layer/husk-tl-internal.h: prewarm
+    // is one-shot, and the translation layer prewarms with its own constant
+    // when it gets there first.
     static let jitBytes = 512 * 1024 * 1024
 
     /// True once the region is held. The memory budget needs this: after a
