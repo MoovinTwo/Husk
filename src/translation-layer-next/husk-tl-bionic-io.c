@@ -639,7 +639,19 @@ static void note_signal(const char *how, int sig)
 {
     if (sig == 6 || sig == 9 || sig == 11 || sig == 15 || sig == 3) tl_log_line("bionic: guest asked for signal %d (%s)", sig, how);
 }
-static int b_raise(int sig) { note_signal("raise", sig); int d = tl_signal_to_darwin(sig); if (d < 0) { tl_set_guest_errno(22); return -1; } return raise(d); }
+/* SIGABRT or SIGKILL raised on itself is the guest ending itself, which tl_guest_fatal turns into the guest's end rather
+ * than the app's. A SIGABRT handler the guest recorded is not run first, for the reason bionic_abort gives. */
+static int b_raise(int sig)
+{
+    note_signal("raise", sig);
+    if (sig == 6 || sig == 9) {
+        char what[32]; snprintf(what, sizeof(what), "raise(%d)", sig);
+        tl_guest_fatal(128 + sig, what, __builtin_return_address(0));
+    }
+    int d = tl_signal_to_darwin(sig);
+    if (d < 0) { tl_set_guest_errno(22); return -1; }
+    return raise(d);
+}
 
 
 /* ------------------------------------------------- raw Linux system calls */

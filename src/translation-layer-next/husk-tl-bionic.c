@@ -247,24 +247,49 @@ static void describe_caller(void *lr, char *out, size_t n)
     else snprintf(out, n, "%p", lr);
 }
 
+/* When set, a guest exit() ends the guest, not the app that is hosting it. The hook does not return. */
+void (*tl_guest_exit_hook)(int status);
+
+/*
+ * The guest ending itself the hard way: abort(), _exit(), or SIGABRT or SIGKILL raised on its own process. On Android
+ * that ends the game's process; here the game shares a process with the app, so it ends the guest instead, as exit()
+ * does, with the status a shell would report (128 plus the signal for a signal). Without a hook this returns, and the
+ * caller ends the process as it always did.
+ */
+void tl_guest_fatal(int status, const char *what, void *lr)
+{
+    char where[200];
+    describe_caller(lr, where, sizeof(where));
+    tl_log_line("bionic: %s called from %s", what, where);
+    if (tl_guest_exit_hook) tl_guest_exit_hook(status);
+}
+
 static void guest_abort(const char *why)
 {
     char where[200];
     describe_caller(__builtin_return_address(0), where, sizeof(where));
     tl_log_line("bionic: guest abort (%s) at %s", why, where);
+    if (tl_guest_exit_hook) tl_guest_exit_hook(128 + 6);
     abort();
 }
 
+/*
+ * Android's abort() runs a SIGABRT handler the guest installed before the process dies. That handler is recorded but
+ * never installed (husk-tl-bionic-io.c keeps fault signals, SIGABRT among them, with the host), and it is not run here
+ * either: it is nearly always a crash reporter, which would be handed a Darwin context it reads as Linux, and which
+ * ends by re-raising SIGABRT anyway. The log line names the caller instead.
+ */
 static void bionic_abort(void)
 {
-    char where[200];
-    describe_caller(__builtin_return_address(0), where, sizeof(where));
-    tl_log_line("bionic: abort() called from %s", where);
+    tl_guest_fatal(128 + 6, "abort()", __builtin_return_address(0));
     abort();
 }
 
-/* When set, a guest exit() ends the guest, not the app that is hosting it. The hook does not return. */
-void (*tl_guest_exit_hook)(int status);
+static void bionic__exit(int status)
+{
+    tl_guest_fatal(status, "_exit()", __builtin_return_address(0));
+    _exit(status);
+}
 
 static void bionic_exit(int status)
 {
@@ -282,6 +307,7 @@ static void bionic___assert2(const char *file, int line, const char *func, const
     char where[200];
     describe_caller(__builtin_return_address(0), where, sizeof(where));
     tl_log_line("bionic: assertion failed: %s:%d: %s: %s (from %s)", file, line, func ? func : "?", expr, where);
+    if (tl_guest_exit_hook) tl_guest_exit_hook(128 + 6);
     abort();
 }
 
@@ -566,7 +592,8 @@ const tl_bionic_entry tl_tab_core[] = {
     TL_WRAP("closelog", bionic_closelog),
     TL_WRAP("abort", bionic_abort),
     TL_WRAP("exit", bionic_exit),
-    TL_DIRECT(_exit),
+    TL_WRAP("_exit", bionic__exit),
+    TL_WRAP("_Exit", bionic__exit),
     TL_WRAP("__stack_chk_fail", bionic___stack_chk_fail),
     TL_WRAP("__assert2", bionic___assert2),
     TL_WRAP("android_set_abort_message", bionic_android_set_abort_message),

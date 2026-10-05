@@ -19,6 +19,7 @@
 #include <sys/stat.h>
 #include <signal.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -94,8 +95,8 @@ static int b_mlock(const void *a, size_t n) { (void)a; (void)n; return 0; }
 static int b_kill(int pid, int sig)
 {
     if (pid == getpid() && sig != 0) {
-        tl_log_line("cxx: the game raised signal %d on its own process", sig);
-        if (tl_guest_exit_hook) tl_guest_exit_hook(128 + sig);
+        char what[48]; snprintf(what, sizeof(what), "kill(self, %d)", sig);
+        tl_guest_fatal(128 + sig, what, __builtin_return_address(0));
         return 0;
     }
     int ds = sig == 0 ? 0 : tl_signal_to_darwin(sig);
