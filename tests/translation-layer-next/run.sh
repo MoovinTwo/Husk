@@ -26,3 +26,4 @@ run() {
 }
 
 run jni_test "$HERE/jni_test.c"
+run anon_test "$HERE/anon_test.c"
