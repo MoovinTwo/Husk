@@ -260,6 +260,7 @@ static __thread bool t_guest_thread;           /* started by the guest: its pads
 
 bool tl_guest_ended(void) { return atomic_load_explicit(&g_guest_ended, memory_order_acquire); }
 void tl_guest_thread_mark(void) { t_guest_thread = true; }
+bool tl_guest_thread_marked(void) { return t_guest_thread; }
 
 bool tl_guest_pad_push(tl_guest_pad *p)
 {
@@ -301,6 +302,12 @@ void tl_guest_fatal(int status, const char *what, void *lr)
     describe_caller(lr, where, sizeof(where));
     tl_log_line("bionic: %s called from %s", what, where);
     if (tl_guest_exit_hook) tl_guest_exit_hook(status);
+}
+
+void tl_guest_abort_at(const char *what, void *lr)
+{
+    tl_guest_fatal(128 + 6, what, lr);
+    abort();
 }
 
 static void guest_abort(const char *why)

@@ -54,6 +54,7 @@ void tl_guest_pad_pop(tl_guest_pad *p);
 void tl_guest_unwind(void);
 /* Marks the calling thread as one the guest started (pthread_create's shim): pads on it are never landed on. */
 void tl_guest_thread_mark(void);
+bool tl_guest_thread_marked(void);
 
 /*
  * Run guest code under a landing pad. sigsetjmp has to be called from the frame that stays live, so this is a macro;

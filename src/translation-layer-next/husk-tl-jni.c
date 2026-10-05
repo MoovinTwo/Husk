@@ -631,7 +631,7 @@ static void jni_ExceptionDescribe(void *env)
     tl_log_line("jni: pending exception %s: %s", t_pending->cls->name, tl_jni_string(m.l) ? tl_jni_string(m.l) : "");
 }
 static void jni_ExceptionClear(void *env) { (void)env; tl_jni_clear(); }
-static void jni_FatalError(void *env, const char *msg) { (void)env; tl_log_line("jni: FatalError: %s", msg); abort(); }
+static void jni_FatalError(void *env, const char *msg) { (void)env; tl_log_line("jni: FatalError: %s", msg); tl_guest_abort_at("JNI FatalError", __builtin_return_address(0)); }
 static int32_t jni_PushLocalFrame(void *env, int32_t cap) { (void)env; lf_push(LF_GUEST, cap > 0 ? (uint32_t)cap : 0); return 0; }
 static jo jni_PopLocalFrame(void *env, jo r)
 {
