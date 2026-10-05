@@ -4,7 +4,8 @@
  *
  *   unity-test <apk> [seconds]
  *
- * Environment: TL_JNI_TRACE=1|2 (log JNI lookups / every call), TL_SKIP=a.so,...
+ * Environment: TL_JNI_TRACE=1|2 (log JNI lookups / every call), TL_SKIP=a.so,...,
+ * TL_PATH_UNCONFINED=1 (let the guest reach files outside its data directory and the APK).
  */
 #include <mach/mach.h>
 #include <mach/mach_vm.h>

@@ -40,6 +40,8 @@ bool tl_ld_add_apk(const char *path);
 /* The APKs added, in order, for asset access; NULL past the last. */
 struct tl_zip;
 const struct tl_zip *tl_ld_apk_at(int index);
+/* The path each was added by, for the guest's read-only view of them; NULL past the last. */
+const char *tl_ld_apk_path(int index);
 
 /*
  * Load a library by file name or soname (already-loaded ones are returned as

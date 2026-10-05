@@ -77,6 +77,7 @@
 		B4CE75407A317521C77A2207 /* husk-tl-jni-loop.c in Sources */ = {isa = PBXBuildFile; fileRef = FE8922E7AB75C8C61B37986A /* husk-tl-jni-loop.c */; };
 		B7335D9F68CE6EAF0E3D9825 /* icon-tintedlight.png in Resources */ = {isa = PBXBuildFile; fileRef = 336AB2FDC58A5C08D55FF8F9 /* icon-tintedlight.png */; };
 		BA42565FACC0AAC10D8FEAF6 /* husk-tl-bionic-io.c in Sources */ = {isa = PBXBuildFile; fileRef = 7CC582FAC1F17C1C659C9D47 /* husk-tl-bionic-io.c */; };
+		A1B2C3D4E5F60718293A4B5C /* husk-tl-bionic-path.c in Sources */ = {isa = PBXBuildFile; fileRef = 5C4B3A2918070F6E5D4C3B2A /* husk-tl-bionic-path.c */; };
 		BBA9636793435EF7679E62F1 /* HuskAudio.swift in Sources */ = {isa = PBXBuildFile; fileRef = 14E50E2B9CCFF7B1FEF73608 /* HuskAudio.swift */; };
 		BC3BB676A454632D3686E110 /* husk-tl-shim.c in Sources */ = {isa = PBXBuildFile; fileRef = 08B65F9A6BAA4E2376A0CBD8 /* husk-tl-shim.c */; };
 		BEDEEECE3AEB59701665C0D3 /* StikJIT.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = BBCF8D04E0CEDAB3542C5271 /* StikJIT.xcframework */; };
@@ -217,6 +218,7 @@
 		771B4FD56CABC214FEED6DFE /* GuestImage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GuestImage.swift; sourceTree = "<group>"; };
 		79E4865C5FE44ADD210A4917 /* OnboardingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingView.swift; sourceTree = "<group>"; };
 		7CC582FAC1F17C1C659C9D47 /* husk-tl-bionic-io.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "husk-tl-bionic-io.c"; sourceTree = "<group>"; };
+		5C4B3A2918070F6E5D4C3B2A /* husk-tl-bionic-path.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "husk-tl-bionic-path.c"; sourceTree = "<group>"; };
 		7F8AFBCC1E9A402444C2D1E6 /* husk-tl-bionic-net.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "husk-tl-bionic-net.c"; sourceTree = "<group>"; };
 		7FD8DC66414547110F0E0B0E /* husk-tl-res.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "husk-tl-res.c"; sourceTree = "<group>"; };
 		7FE5D3DD79B5BEA14506FF60 /* husk-tl-dex.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "husk-tl-dex.c"; sourceTree = "<group>"; };
@@ -390,6 +392,7 @@
 				473B239012BE00391A4164ED /* husk-tl-audio.h */,
 				44BAD09F39FA4184F97AB0D0 /* husk-tl-bionic-cxx.c */,
 				7CC582FAC1F17C1C659C9D47 /* husk-tl-bionic-io.c */,
+				5C4B3A2918070F6E5D4C3B2A /* husk-tl-bionic-path.c */,
 				FF5A120A4E0B3EE166D789C4 /* husk-tl-bionic-ndk.c */,
 				7F8AFBCC1E9A402444C2D1E6 /* husk-tl-bionic-net.c */,
 				C2150DD286E82127CB5B7C8B /* husk-tl-bionic-pthread.c */,
@@ -699,6 +702,7 @@
 				80C126C7BDB5EE56A7139C20 /* husk-tl-audio.c in Sources */,
 				2382523F24A95C0E58189C78 /* husk-tl-bionic-cxx.c in Sources */,
 				BA42565FACC0AAC10D8FEAF6 /* husk-tl-bionic-io.c in Sources */,
+				A1B2C3D4E5F60718293A4B5C /* husk-tl-bionic-path.c in Sources */,
 				E165A4CCFD518F67D08A4696 /* husk-tl-bionic-ndk.c in Sources */,
 				3519D130E3ACECEB2A25D174 /* husk-tl-bionic-net.c in Sources */,
 				6A8A2290222C62C81EBF2E3E /* husk-tl-bionic-pthread.c in Sources */,

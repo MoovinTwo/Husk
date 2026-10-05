@@ -6,7 +6,8 @@
  *
  * Geometry Dash is a landscape game, so the default surface is landscape (the phone's aspect).
  * Environment: TL_JNI_TRACE=1|2, TL_VERBOSE=0..2, TL_CTL=<fifo> (lines "tap X Y", "hold X Y MS",
- * "swipe X1 Y1 X2 Y2 MS", "wait MS", "shot PNG", "text WORD", "bs", "pause", "resume", "quit"), TL_FRAMES=<n> (save every nth frame; default latest only).
+ * "swipe X1 Y1 X2 Y2 MS", "wait MS", "shot PNG", "text WORD", "bs", "pause", "resume", "quit"), TL_FRAMES=<n> (save every nth frame; default latest only),
+ * TL_PATH_UNCONFINED=1 (let the guest reach files outside its data directory and the APK).
  */
 #include <mach/mach.h>
 #include <pthread.h>

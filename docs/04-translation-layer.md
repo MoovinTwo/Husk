@@ -197,6 +197,29 @@ This is the largest mechanical part of the loader. Structure layouts (`stat`,
 `__sF` stdio all differ. The scanner's per-app "Android libraries it needs"
 list is the list of what has to be provided.
 
+### Guest file paths: confined
+
+A game's native code runs inside Husk's own process, so without a check every
+path it opens would reach whatever Husk's sandbox can: guest images and other
+apps' data in Documents, Husk's preferences. Every path-taking bionic wrapper
+(`open`, `fopen`, `stat`, `mkdir`, `rename`, the `*at` calls and the rest)
+goes through `tl_path_confine` in `husk-tl-bionic-path.c` first. The path is
+made absolute against the guest's own working directory (kept by the shim, not
+the process), collapsed lexically, Android's locations (`/data/data/<pkg>`,
+`/data/user/0/<pkg>`, `/sdcard`) are moved into the app's data directory, and
+the result must lie under a root: the data directory (read-write), the APKs
+the loader opened and the app bundle (read-only), and `/dev/null`, `/dev/zero`,
+`/dev/random`, `/dev/urandom`. A write to a read-only root is `EACCES`;
+anything else is `ENOENT`. The deepest existing part of a path is resolved with
+`realpath` and checked again, so a symbolic link cannot lead out. The made-up
+`/proc` and `/sys` files are answered before the check.
+
+This is defence in depth, not a sandbox: native code in the process can still
+read Husk's memory, issue system calls itself, and race the check against a
+rename. `TL_PATH_UNCONFINED=1` turns the check off for the Mac harnesses in
+`tools/`; they run confined by default, with the APK they were given and the
+temporary data directory they make.
+
 ### 32-bit apps: not possible natively
 
 Apple's CPUs have not executed AArch32 code since the A11. An APK with only

@@ -91,6 +91,7 @@ static struct {
     tl_lib *libs[MAX_LIBS];
     int nlibs;
     tl_zip apks[4];
+    char apk_paths[4][1024];
     int napks;
     int verbosity;
     size_t unresolved;
@@ -117,11 +118,13 @@ bool tl_ld_add_apk(const char *path)
         tl_log_line("ld: cannot open %s: %s", path, err);
         return false;
     }
+    snprintf(G.apk_paths[G.napks], sizeof(G.apk_paths[0]), "%s", path);
     G.napks++;
     return true;
 }
 
 const tl_zip *tl_ld_apk_at(int i) { return (i >= 0 && i < G.napks) ? &G.apks[i] : NULL; }
+const char *tl_ld_apk_path(int i) { return (i >= 0 && i < G.napks) ? G.apk_paths[i] : NULL; }
 
 static bool fetch_from_apks(const char *name, uint8_t **out, size_t *len)
 {

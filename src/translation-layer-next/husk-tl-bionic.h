@@ -76,6 +76,30 @@ void tl_set_guest_errno(int guest_errno);
 #define TL_ERRNO_BEGIN()  (errno = 0)
 #define TL_ERRNO_END()    do { if (errno) tl_set_guest_errno(tl_errno_to_guest(errno)); } while (0)
 
+/* ----------------------------------------------------------------- paths */
+
+/*
+ * Every guest path goes through tl_path_confine before the host sees it (husk-tl-bionic-path.c says what is
+ * allowed). `how` is what the caller is about to do; the host path is written to `buf` and returned, or NULL is
+ * returned with the guest's errno set and the caller fails without making the call.
+ */
+enum {
+    TL_PATH_READ     = 0,      /* read what is there: open for reading, opendir, readlink */
+    TL_PATH_WRITE    = 1,      /* create, change or remove */
+    TL_PATH_META     = 2,      /* metadata only (stat, access, realpath, chdir): also allowed above a root */
+    TL_PATH_NOFOLLOW = 0x10,   /* the call does not follow a link in the last component (lstat, unlink, rename) */
+};
+const char *tl_path_confine(const char *path, int how, char *buf, size_t n);
+/* For the *at() calls: `path` taken relative to the guest's directory descriptor `dirfd` (or its AT_FDCWD), as a
+ * path to hand to the plain call -- which confines it. NULL with the guest's errno set when that cannot be done. */
+const char *tl_path_at(int dirfd, const char *path, char *buf, size_t n);
+/* The guest's working directory, kept apart from the process's. */
+int   tl_path_chdir(const char *path);
+char *tl_path_getcwd(char *buf, size_t n);
+/* The app's data directory, set per launch; /tmp until it is. */
+void        tl_set_data_dir(const char *dir);
+const char *tl_data_dir(void);
+
 /* Signal numbers: Linux <-> Darwin. 0 and negative on no equivalent. */
 int tl_signal_to_darwin(int linux_sig);
 int tl_signal_from_darwin(int darwin_sig);
