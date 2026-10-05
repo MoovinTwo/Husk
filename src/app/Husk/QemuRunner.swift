@@ -959,7 +959,7 @@ final class QemuRunner: ObservableObject {
     // transfer -- clean file-backed pages are evictable and charged
     // differently.
     // The region the app claims, not tb-size: prewarm takes
-    // JITBootstrap.jitBytes and QEMU is handed that whole region.
+    // JITBootstrap.jitBytes, and QEMU carves its tb-size slice out of it.
     static let jitRegionMiB = JITBootstrap.jitBytes / (1024 * 1024)
     static let qemuOverheadMiB = 750 // measured, not guessed
     // Real margin, in megabytes rather than a fraction. A fraction of what

@@ -93,8 +93,9 @@ HuskDualMapping husk_ios_jit_allocate(size_t bytes);
  * Claim the JIT region now, at app launch, and hold it until QEMU asks.
  * StikDebug does not stay attached forever, and a first run spends a minute
  * downloading the guest before QEMU starts -- by which time the debugger has
- * let go and no executable memory can be had at all. Pass the same size QEMU
- * will ask for (tb-size).
+ * let go and no executable memory can be had at all. Pass
+ * HUSK_JIT_REGION_BYTES: QEMU carves its tb-size buffer out of the region and
+ * the translation layer takes its slices from the rest.
  */
 HUSK_EXPORT bool husk_ios_jit_prewarm(size_t bytes);
 

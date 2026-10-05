@@ -40,9 +40,9 @@ enum JITBootstrap {
                          + "return 0 instead of killing the process")
     }
 
-    /// Size QEMU will ask for. Must match tb-size in the phase 1 command line:
-    /// a smaller region here means QEMU allocates a second one, at a point where
-    /// StikDebug may be long gone.
+    /// Size of the region QEMU and the native runtime share. Must be at least
+    /// tb-size in the phase 1 command line: a smaller region here means QEMU
+    /// allocates a second one, at a point where StikDebug may be long gone.
     // Back to 256 MiB. Raising this to 512 was one of three changes made at
     // once in v15, and v15 was the first build to die inside qemu_init(). The
     // guest RAM -- the other suspect -- has since been shown to map and write
@@ -51,8 +51,8 @@ enum JITBootstrap {
     // carves the buffer into per-vCPU regions.
     //
     // 512 MiB since the native runtime runs Minecraft: its main library alone is a 354 MiB image that has to sit in this
-    // region, with the stubs the loader places beside it. A larger prewarm is safe for QEMU, which is handed the
-    // prewarmed region whenever it is at least what tb-size asks for.
+    // region, with the stubs the loader places beside it. A larger prewarm is safe for QEMU, which carves its
+    // tb-size buffer out of the region and leaves the rest to the native runtime.
     //
     // Must match HUSK_JIT_REGION_BYTES in src/ios-jit/husk-ios-jit.h and
     // TL_JIT_REGION_BYTES in src/translation-layer/husk-tl-internal.h: prewarm
