@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Host-side tests. Everything runnable on Linux is wired through
+# tests/translation-layer/run.sh, so new C tests only need a line there.
+# The iOS app itself is built locally on macOS with scripts/ci_build.sh.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  translation-layer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm python3 zlib1g-dev \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
+
+      - name: Tool versions
+        run: |
+          clang --version | head -n1
+          ld.lld --version
+          llvm-readelf --version | head -n2
+          aarch64-linux-gnu-gcc --version | head -n1
+          (command -v qemu-aarch64 || command -v qemu-aarch64-static)
+
+      - name: Run tests
+        run: sh tests/translation-layer/run.sh
