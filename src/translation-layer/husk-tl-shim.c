@@ -19,6 +19,7 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
+#include <math.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
@@ -778,9 +779,20 @@ void tl_shim_bind_run(void *activity, void *window)
     (void)window;
 }
 
+/* sincos and sincosf are GNU extensions bionic's libm exports and Darwin's
+ * does not, so the dlsym fallback below cannot find them. Clang turns a sin()
+ * and cos() of the same argument into one sincos() call, so they turn up in
+ * engines that never name them (GameMaker's libyoyo.so). */
+static void sincos_shim(double x, double *s, double *c) { *s = sin(x); *c = cos(x); }
+static void sincosf_shim(float x, float *s, float *c) { *s = sinf(x); *c = cosf(x); }
+
 /* One line each. Order does not matter; the linear scan is honest and
  * small. */
 static const tl_export_entry g_exports[] = {
+    /* libm */
+    { "sincos",                     sincos_shim },
+    { "sincosf",                    sincosf_shim },
+
     /* logging */
     { "__android_log_print",        __android_log_print },
     { "__android_log_write",        __android_log_write },
