@@ -17,6 +17,7 @@
 void  tl_log_line(const char *fmt, ...);
 void *tl_bionic_find(const char *name);
 bool  tl_bionic_is_system_lib(const char *soname);
+unsigned long tl_bionic_auxval(unsigned long type);
 
 /* ------------------------------------------------------------------ ELF */
 
@@ -954,6 +955,22 @@ static uint64_t bind_symbol(tl_lib *L, uint32_t symidx, bool *failed)
     return val;
 }
 
+/*
+ * An IFUNC resolver picks an implementation by what the CPU can do, and is called as Android's linker calls it on
+ * arm64: resolver(hwcap | _IFUNC_ARG_HWCAP, &arg), the flag saying the second argument is there. A resolver called
+ * with no arguments reads whatever is in x0 and x1 as the capabilities, and may pick code this CPU cannot run. The
+ * values are the ones getauxval gives the guest, so that what a resolver picks matches what the code it picks checks.
+ */
+typedef struct { unsigned long size, hwcap, hwcap2; } ifunc_arg;   /* bionic's __ifunc_arg_t */
+#define IFUNC_ARG_HWCAP (1ULL << 62)
+
+static uint64_t run_ifunc_resolver(const void *fn)
+{
+    ifunc_arg arg = { sizeof(arg), tl_bionic_auxval(16 /* AT_HWCAP */), tl_bionic_auxval(26 /* AT_HWCAP2 */) };
+    uint64_t (*resolver)(uint64_t, ifunc_arg *) = (uint64_t (*)(uint64_t, ifunc_arg *))(uintptr_t)fn;
+    return resolver(arg.hwcap | IFUNC_ARG_HWCAP, &arg);
+}
+
 static bool reloc_one(tl_lib *L, uint64_t r_offset, uint32_t type, uint32_t symidx, int64_t addend)
 {
     uint64_t off = r_offset - L->base_vaddr;
@@ -974,12 +991,10 @@ static bool reloc_one(tl_lib *L, uint64_t r_offset, uint32_t type, uint32_t symi
         *place = v + (type == R_ABS64 ? (uint64_t)addend : 0);
         return true;
     }
-    case R_IRELATIVE: {
+    case R_IRELATIVE:
         /* The resolver is guest code: run it, store what it returns. */
-        uint64_t (*resolver)(void) = (uint64_t (*)(void))(uintptr_t)(L->rx + ((uint64_t)addend - L->base_vaddr));
-        *place = resolver();
+        *place = run_ifunc_resolver(L->rx + ((uint64_t)addend - L->base_vaddr));
         return true;
-    }
     case R_TLS_DTPMOD: case R_TLS_TPREL: case R_TLSDESC:
         tl_log_line("ld: %s: TLS relocation (type %u) -- thread-local storage is not implemented", L->name, type);
         return false;

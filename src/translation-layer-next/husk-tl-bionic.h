@@ -57,6 +57,7 @@ void tl_guest_fatal(int status, const char *what, void *lr);
 
 void *tl_bionic_find(const char *name);
 bool  tl_bionic_is_system_lib(const char *soname);
+unsigned long tl_bionic_auxval(unsigned long type);   /* what the guest's getauxval(type) answers; 0 when it has none */
 
 /* ----------------------------------------------------------------- errno */
 

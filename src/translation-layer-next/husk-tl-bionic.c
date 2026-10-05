@@ -362,18 +362,30 @@ static void bionic___cxa_finalize(void *dso)
 
 /* -------------------------------------------------------- system queries */
 
-static unsigned long bionic_getauxval(unsigned long type)
+/* The auxiliary vector, in one place: getauxval answers from it, and so do the hardware capabilities the loader hands
+ * IFUNC resolvers (husk-tl-ld.c), so a resolver and the code it picks cannot disagree about the CPU. False for a type
+ * this vector does not have. */
+static bool auxval(unsigned long type, unsigned long *v)
 {
     static uint8_t random16[16] = { 0x4a, 0x13, 0x9c, 0x71, 0xe2, 0x05, 0x88, 0x3d, 0xb6, 0x21, 0x5f, 0xc4, 0x90, 0x2e, 0x67, 0xd8 };
     switch (type) {
-    case 6:  return 16384;                                   /* AT_PAGESZ */
-    case 16: return 0xff;                                    /* AT_HWCAP: FP, ASIMD, EVTSTRM, AES, PMULL, SHA1, SHA2, CRC32 */
-    case 26: return 0;                                       /* AT_HWCAP2 */
-    case 25: return (unsigned long)random16;                 /* AT_RANDOM */
-    case 17: return 100;                                     /* AT_CLKTCK */
-    case 23: return 0;                                       /* AT_SECURE */
-    default: errno = 0; tl_set_guest_errno(2); return 0;
+    case 6:  *v = 16384; return true;                        /* AT_PAGESZ */
+    case 16: *v = 0xff; return true;                         /* AT_HWCAP: FP, ASIMD, EVTSTRM, AES, PMULL, SHA1, SHA2, CRC32 */
+    case 26: *v = 0; return true;                            /* AT_HWCAP2 */
+    case 25: *v = (unsigned long)random16; return true;      /* AT_RANDOM */
+    case 17: *v = 100; return true;                          /* AT_CLKTCK */
+    case 23: *v = 0; return true;                            /* AT_SECURE */
+    default: *v = 0; return false;
     }
+}
+
+unsigned long tl_bionic_auxval(unsigned long type) { unsigned long v; auxval(type, &v); return v; }
+
+static unsigned long bionic_getauxval(unsigned long type)
+{
+    unsigned long v;
+    if (!auxval(type, &v)) { errno = 0; tl_set_guest_errno(2); }
+    return v;
 }
 
 static int bionic_getpagesize(void) { return 16384; }
