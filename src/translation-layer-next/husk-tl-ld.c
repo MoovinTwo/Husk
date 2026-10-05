@@ -65,6 +65,7 @@ struct tl_lib {
     uint64_t init, init_array, init_arraysz;
     uint32_t nsyms;
     uint64_t *symcache;            /* resolved import per symbol index; 0 = not yet */
+    _Atomic(uint64_t) *_Atomic ifunc;   /* what each of this library's own IFUNC symbols resolved to, by symbol index; 0 = not yet */
 
     uint64_t needed[MAX_DEPS];
     int nneeded;
@@ -188,6 +189,44 @@ static void *sym_value(const tl_lib *L, const elf_sym *s)
     return L->rx + off;
 }
 
+static bool is_ifunc(const elf_sym *s) { return (s->st_info & 0xf) == STT_GNU_IFUNC_; }
+
+/*
+ * What a defined symbol resolves to. For an IFUNC that is whatever its resolver returns: the resolver is guest code,
+ * run once per library and symbol, and the answer is kept so that every library binding the symbol, and dlsym, get
+ * the same function. Two threads asking at once may both run it; resolvers are pure, so either answer will do.
+ *
+ * The caller decides when a resolver may run: once the library defining it is relocated (ifunc_ready), or, for a
+ * library's own symbols, while that library is being relocated, as bionic does (see bind_symbol).
+ */
+static uint64_t run_ifunc_resolver(const void *fn);
+
+static void *resolve_sym(tl_lib *L, const elf_sym *s)
+{
+    if (!is_ifunc(s)) return sym_value(L, s);
+    uint32_t idx = (uint32_t)(s - sym_at(L, 0));
+    _Atomic(uint64_t) *cache = NULL;
+    if (idx < L->nsyms) {
+        cache = atomic_load(&L->ifunc);
+        if (!cache) {
+            _Atomic(uint64_t) *fresh = calloc(L->nsyms, sizeof(*fresh));
+            if (fresh && atomic_compare_exchange_strong(&L->ifunc, &cache, fresh)) cache = fresh;
+            else free(fresh);       /* another thread's table won (cache now holds it), or no memory: run uncached */
+        }
+    }
+    uint64_t v = cache ? atomic_load(&cache[idx]) : 0;
+    if (!v) {
+        v = run_ifunc_resolver(sym_value(L, s));
+        if (cache) atomic_store(&cache[idx], v ? v : 1);   /* 1 marks a resolver that answered NULL */
+    } else if (v == 1) {
+        v = 0;
+    }
+    return (void *)(uintptr_t)v;
+}
+
+/* Whether resolve_sym may run s's resolver now: a resolver in a library not yet relocated reads unrelocated data. */
+static bool ifunc_ready(const tl_lib *L, const elf_sym *s) { return !is_ifunc(s) || L->state >= 2; }
+
 static const elf_sym *lib_find(const tl_lib *L, const char *name)
 {
     if (!L->symtab || !L->strtab) return NULL;
@@ -279,16 +318,24 @@ static void build_scope(tl_lib *L)
     L->deps_ready = true;
 }
 
-/* Symbol lookup the way a library sees it: its own scope, then the system. */
+/*
+ * Symbol lookup the way a library sees it: its own scope, then the system. Only bind_symbol calls this, while L is
+ * being relocated, so an IFUNC of L's own resolves now, mid-relocation, as bionic resolves it. load_locked loads and
+ * relocates every needed library before the one needing it, so the deps are relocated and their resolvers may run --
+ * except around a cycle in the dependency graph, where a dep can still be waiting on its own deps (state 0), or a dep
+ * whose relocation failed (state 1). Such a dep's IFUNC is passed over, and the import binds to whatever comes later.
+ */
 static void *lookup_for(tl_lib *L, const char *name, bool *weak_hit)
 {
     (void)weak_hit;
     build_scope(L);
     const elf_sym *s = lib_find(L, name);
-    if (s && (s->st_info & 0xf) != STT_GNU_IFUNC_) return sym_value(L, s);
+    if (s) return resolve_sym(L, s);
     for (int i = 0; i < L->ndeps; i++) {
         s = lib_find(L->deps[i], name);
-        if (s && (s->st_info & 0xf) != STT_GNU_IFUNC_) return sym_value(L->deps[i], s);
+        if (!s) continue;
+        if (ifunc_ready(L->deps[i], s)) return resolve_sym(L->deps[i], s);
+        tl_log_line("ld: %s: %s is an IFUNC in %s, which is not relocated yet; passed over", L->name, name, L->deps[i]->name);
     }
     return tl_bionic_find(name);
 }
@@ -297,11 +344,11 @@ void *tl_ld_sym(tl_lib *lib, const char *name)
 {
     if (lib) {
         const elf_sym *s = lib_find(lib, name);
-        return s ? sym_value(lib, s) : NULL;
+        return s && ifunc_ready(lib, s) ? resolve_sym(lib, s) : NULL;
     }
     for (int i = 0; i < G.nlibs; i++) {
         const elf_sym *s = lib_find(G.libs[i], name);
-        if (s) return sym_value(G.libs[i], s);
+        if (s && ifunc_ready(G.libs[i], s)) return resolve_sym(G.libs[i], s);
     }
     return NULL;
 }
@@ -933,9 +980,13 @@ static uint64_t bind_symbol(tl_lib *L, uint32_t symidx, bool *failed)
     if (s->st_shndx != SHN_UNDEF_ && (s->st_info >> 4) != STB_WEAK_) {
         /* Defined here. Search the scope anyway so an earlier library's definition
          * wins, as it does under ELF interposition... except that a library's own
-         * definition is what Android's linker uses first for its own symbols. */
-        if ((s->st_info & 0xf) == STT_GNU_IFUNC_) { *failed = true; return 0; }
-        val = (uint64_t)(uintptr_t)sym_value(L, s);
+         * definition is what Android's linker uses first for its own symbols.
+         *
+         * An IFUNC's resolver runs now, as R_IRELATIVE's does: in bionic's order, but with the same risks. The
+         * relocations after this one are not applied yet, and patch_image has not run, so the resolver sees the code
+         * as the file has it (tpidr_el0, x18, adrp to writable data unrewritten) and nothing has flushed the
+         * instruction cache. A resolver that only tests its arguments and returns an address is safe. */
+        val = (uint64_t)(uintptr_t)resolve_sym(L, s);
     } else {
         void *a = lookup_for(L, name, NULL);
         if (a) {
