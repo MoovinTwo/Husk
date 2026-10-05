@@ -280,6 +280,25 @@ interpreter-only: `-Xusejit:false`, and no boot-image dex2oat (ATL's README
 gives the same workaround for Apple Silicon Linux). The JIT follows once the
 code cache sits on Husk's RW/RX pair.
 
+## TLS roots
+
+Unity's mbedtls asks Java for the platform's trusted roots
+(`TrustManagerFactory` → `getAcceptedIssuers()`), and gets them from
+`src/translation-layer-next/husk-tl-jni-tls.c`, which reads a PEM bundle shipped in the app:
+`src/app/Husk/Resources/cacert.pem`. Without it every HTTPS request fails as
+not trusted. The bundle is static and only changes when someone replaces it.
+
+`scripts/update_cacert.sh` refreshes it from curl's extraction of Mozilla's
+store (`https://curl.se/ca/cacert.pem`), checking the download against the
+`.sha256` curl.se publishes beside it and refusing a short or mismatching file.
+Run it before a release, and whenever Mozilla removes a CA (curl.se lists the
+dates). Check the result on a device before committing it: the bundle shipped
+in `00ecffb` is not Mozilla's -- it carries Apple's own roots and S/MIME roots,
+as macOS's `/etc/ssl/cert.pem` does -- and Mozilla's current store also drops
+long-lived roots that Android's store has long included (for example DigiCert
+Global Root CA and GlobalSign Root CA), so switching can make a game's server
+stop verifying.
+
 ## Milestones
 
 | # | What | State |
