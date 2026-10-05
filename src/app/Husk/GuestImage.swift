@@ -71,6 +71,42 @@ final class GuestImage: ObservableObject {
         UserDefaults.standard.object(forKey: "husk.downloadSnapshot") as? Bool ?? true
     }
 
+    /// Whether to fetch and restore the snapshot even when it looks too large
+    /// for this phone. Off by default; see `snapshotFits(guestMiB:)`.
+    nonisolated static var forceSnapshot: Bool {
+        UserDefaults.standard.bool(forKey: "husk.forceSnapshot")
+    }
+
+    /// Whether a snapshot pinned to `guestMiB` can be restored here without
+    /// jetsam killing the app partway through.
+    ///
+    /// The size is not negotiable -- QEMU will not restore into a machine of
+    /// any other -- so the only question is whether it fits beside the JIT and
+    /// QEMU itself, asked with the same arithmetic a cold boot is sized by. The
+    /// 4096 MiB machine does not on a 6 GB phone, and a restore that cannot
+    /// fit is a two-gigabyte download that ends in the app being killed.
+    ///
+    /// Unknown counts as not fitting. A cold boot that cannot learn what is
+    /// available takes a deliberately small guest; restoring a fixed,
+    /// multi-gigabyte one into the same uncertainty is the failure this exists
+    /// to prevent, and the force setting is there for anyone who knows better.
+    nonisolated static func snapshotFits(guestMiB: Int) -> Bool {
+        guard let budget = QemuRunner.anonymousGuestBudget() else { return false }
+        return guestMiB <= budget.headroomMiB
+    }
+
+    /// Whether the manifest's snapshot is worth fetching on this phone, saying
+    /// why not when it is not.
+    private func shouldFetchSnapshot(guestMiB: Int) -> Bool {
+        if Self.forceSnapshot || Self.snapshotFits(guestMiB: guestMiB) { return true }
+        let room = QemuRunner.anonymousGuestBudget().map { "\($0.headroomMiB) MiB" }
+            ?? "an unknown amount"
+        HuskLog.log("guest", "not fetching the pre-booted snapshot: it needs \(guestMiB) MiB "
+                           + "of guest RAM and this phone has room for \(room); "
+                           + "Android will boot from cold")
+        return false
+    }
+
     /// A machine that has already finished booting, gzipped.
     ///
     /// Booting Android here takes five to twelve minutes and has to survive
@@ -88,7 +124,7 @@ final class GuestImage: ObservableObject {
     static let snapshotPartCount = 2
     static var snapshotPartURLs: [URL] {
         (0..<snapshotPartCount).map { i in
-            URL(string: "https://github.com/Leviidev/Husk/releases/download/"
+            URL(string: GuestManifest.releasesBase + "/releases/download/"
                       + "\(dependenciesTag)/vdb-snapshot-\(imageVersion).qcow2.gz."
                       + String(format: "%02d", i))!
         }
@@ -105,7 +141,7 @@ final class GuestImage: ObservableObject {
     static let snapshotYres = 800
 
     static var imageURL: URL {
-        URL(string: "https://github.com/Leviidev/Husk/releases/download/"
+        URL(string: GuestManifest.releasesBase + "/releases/download/"
                   + "\(dependenciesTag)/vda-\(imageVersion).qcow2")!
     }
 
@@ -149,6 +185,17 @@ final class GuestImage: ObservableObject {
         // Installs from before digests existed recorded a generation name here
         // instead. Their snapshot is still on disk and still restorable.
         return (try? String(contentsOfFile: snapshotStampPath, encoding: .utf8)) != nil
+    }
+
+    /// A shipped snapshot this phone can actually restore.
+    ///
+    /// Having one is not enough: a snapshot pins its RAM, and one pinned larger
+    /// than the phone can hold is not restored but killed. Such a snapshot is
+    /// left on disk -- it is still valid, and the setting to force it may be
+    /// turned on -- and the machine boots from cold as though it were absent.
+    nonisolated var usableShippedSnapshot: Bool {
+        hasShippedSnapshot
+            && (Self.forceSnapshot || Self.snapshotFits(guestMiB: snapshotPins.mib))
     }
 
     // MARK: digests
@@ -237,11 +284,16 @@ final class GuestImage: ObservableObject {
             HuskLog.log("guest", "image differs: have "
                       + "\(installedImageDigest?.prefix(12) ?? "nothing"), "
                       + "release has \(m.image.sha256.prefix(12))")
-            update = .image(bytes: m.image.size + m.snapshot.size)
+            // The snapshot only follows the image when it will be fetched, so
+            // it is only counted in the size when it will be.
+            let withSnapshot = Self.wantsSnapshot
+                && shouldFetchSnapshot(guestMiB: m.snapshot.guestMiB)
+            update = .image(bytes: m.image.size + (withSnapshot ? m.snapshot.size : 0))
             return
         }
         if Self.wantsSnapshot,
-           (!hasShippedSnapshot || installedSnapshotDigest != m.snapshot.sha256) {
+           (!hasShippedSnapshot || installedSnapshotDigest != m.snapshot.sha256),
+           shouldFetchSnapshot(guestMiB: m.snapshot.guestMiB) {
             HuskLog.log("guest", "snapshot differs: have "
                       + "\(installedSnapshotDigest?.prefix(12) ?? "nothing"), "
                       + "release has \(m.snapshot.sha256.prefix(12))")
@@ -791,7 +843,11 @@ final class GuestImage: ObservableObject {
                 HuskLog.log("guest", "guest image ready (\(size) bytes, \(Self.imageVersion))")
                 // The snapshot only makes sense next to the image it was booted
                 // from, so it is fetched after, not alongside.
-                if Self.wantsSnapshot, !hasShippedSnapshot {
+                // Without a manifest the pins are this build's own, which is
+                // what the release was built against when it shipped.
+                if Self.wantsSnapshot, !hasShippedSnapshot,
+                   shouldFetchSnapshot(guestMiB: manifest?.snapshot.guestMiB
+                                                 ?? Self.snapshotGuestMiB) {
                     state = .installing
                     downloadSnapshot { ok in
                         DispatchQueue.main.async {
