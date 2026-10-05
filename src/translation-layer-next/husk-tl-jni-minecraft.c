@@ -55,6 +55,18 @@ static void RetZero(tl_jcall *c) { c->ret = vi(0); }
 static void RetEmptyString(tl_jcall *c) { c->ret = vl(STR("")); }
 static void RetNull(tl_jcall *c) { c->ret = vl(NULL); }
 
+/*
+ * The licence questions are answered as an unlicensed device that has not heard from a licence server would answer
+ * them, because none was asked: nothing here claims a verified licence. The game may then fall back to trial mode or
+ * refuse to start; that is by design, and no workaround is provided.
+ *
+ * What checkLicense()I returns is not established: the protected MainActivity cannot be read, and nothing in this tree
+ * records its codes. It is assumed that 0 may mean success, as it does for most status codes, and that Google's
+ * licensing codes (LICENSED 0x100, NOT_LICENSED 0x231, RETRY 0x123) may be in play; so -1 is returned, which is none
+ * of those and reads as an error or "no response" under any of them.
+ */
+static void MA_checkLicense(tl_jcall *c) { c->ret = vi(-1); }
+
 /* -------------------------------------------------------------- preferences */
 
 /*
@@ -412,7 +424,9 @@ static const tl_jhle k_hle[] = {
     M_(MAIN, "getDisplayWidth", "()I", MA_displayWidth), M_(MAIN, "getDisplayHeight", "()I", MA_displayHeight),
     M_(MAIN, "getPlatformDpi", "()I", MA_platformDpi),
     M_(MAIN, "hasWriteExternalStoragePermission", "()Z", RetTrue),
-    M_(MAIN, "checkLicense", "()I", RetZero),
+    M_(MAIN, "checkLicense", "()I", MA_checkLicense),
+    /* isDemo asks which build this is (the separate trial APK or the full one), not whether it is licensed, and this
+     * is the full build; so it stays false and is not part of the licence answer. */
     M_(MAIN, "isDemo", "()Z", RetFalse),
     M_(MAIN, "getPlatformStringVar", "(I)Ljava/lang/String;", MA_platformStringVar),
     M_(MAIN, "getTimeFromProcessStart", "()J", MA_timeFromStart),
@@ -467,7 +481,11 @@ static const tl_jhle k_hle[] = {
     M_("com/mojang/minecraftpe/BrazeManager", "isBrazeSDKDisabled", "()Z", RetTrue), M_("com/mojang/minecraftpe/BrazeManager", "setBrazeID", "(Ljava/lang/String;)V", Noop),
 
     M_("com/mojang/minecraftpe/store/StoreFactory", "createGooglePlayStore", "(Ljava/lang/String;Lcom/mojang/minecraftpe/store/StoreListener;)Lcom/mojang/minecraftpe/store/Store;", Store_create),
-    M_(STORE, "hasVerifiedLicense", "()Z", RetTrue), M_(STORE, "receivedLicenseResponse", "()Z", RetTrue),
+    /* No licence server is ever asked, so no response has been received and nothing is verified. "false" for the
+     * response is what a real device that is offline reports; the game has to cope with that state without hanging,
+     * whereas "true but not verified" would claim a refusal that never came. getExtraLicenseData below answers an
+     * empty response whose times and retry count are zero, which claims nothing either. */
+    M_(STORE, "hasVerifiedLicense", "()Z", RetFalse), M_(STORE, "receivedLicenseResponse", "()Z", RetFalse),
     M_(STORE, "getStoreId", "()Ljava/lang/String;", Store_id), M_(STORE, "getProductSkuPrefix", "()Ljava/lang/String;", RetEmptyString),
     M_(STORE, "getRealmsSkuPrefix", "()Ljava/lang/String;", RetEmptyString),
     M_(STORE, "getExtraLicenseData", "()Lcom/mojang/minecraftpe/store/ExtraLicenseResponseData;", Store_extra),
