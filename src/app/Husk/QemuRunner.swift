@@ -626,6 +626,14 @@ final class QemuRunner: ObservableObject {
                 try? String(QemuRunner.pendingSnapshotMiB)
                     .write(toFile: QemuRunner.shared.snapshotSizePath,
                            atomically: true, encoding: .utf8)
+                // This save went into the slot the shipped snapshot occupied.
+                // If this launch cold-booted instead of using it, the shipped
+                // markers now describe a machine that is gone; left in place,
+                // a roomier launch would restore this save into the shipped
+                // snapshot's pinned RAM size.
+                if !QemuRunner.usesShippedSnapshot {
+                    GuestImage.shared.retireShippedSnapshot()
+                }
                 try? QemuRunner.memoryStrategy
                     .write(toFile: QemuRunner.shared.memoryStrategyPath,
                            atomically: true, encoding: .utf8)

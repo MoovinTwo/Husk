@@ -198,6 +198,33 @@ final class GuestImage: ObservableObject {
             && (Self.forceSnapshot || Self.snapshotFits(guestMiB: snapshotPins.mib))
     }
 
+    /// Forget that userdata holds the shipped snapshot, because it no longer does.
+    ///
+    /// A phone the shipped snapshot does not fit boots from cold, and its
+    /// autosave goes into the same qcow2 slot the shipped machine lived in. The
+    /// markers survived that, so a later launch that found more room -- or had
+    /// the force setting on -- believed the shipped snapshot was still there,
+    /// pinned RAM to its 4096 MiB and restored a machine saved at some other
+    /// size into it. QEMU refuses that at best. Once a local save has replaced
+    /// the shipped one, the local save's own size stamp is the only true record.
+    ///
+    /// Called only after a save on a launch that did not use the shipped
+    /// snapshot. A launch that did use it saved the same machine back, and
+    /// retiring then would flip the memory strategy and discard a good save.
+    ///
+    /// nonisolated: the save completes on QEMU's own thread, and this is only
+    /// file removal.
+    nonisolated func retireShippedSnapshot() {
+        let fm = FileManager.default
+        let markers = [snapshotStampPath, snapshotDigestPath, snapshotPinsPath]
+        guard hasShippedSnapshot || markers.contains(where: { fm.fileExists(atPath: $0) })
+        else { return }
+        for path in markers { try? fm.removeItem(atPath: path) }
+        HuskLog.log("snap", "a local save replaced the shipped snapshot in userdata; "
+                          + "forgetting the shipped one so it is never restored at "
+                          + "the wrong size")
+    }
+
     // MARK: digests
 
     /// SHA-256 of the system image this install actually wrote to disk, and of
