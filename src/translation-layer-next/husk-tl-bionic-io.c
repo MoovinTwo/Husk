@@ -392,28 +392,9 @@ static bool anon_room(void)
     return true;
 }
 
-static void anon_add(void *addr, size_t len)
+/* Take [addr, end) out of the table, under g_anon_lock. An entry it cuts through keeps the part on either side. */
+static void anon_cut_locked(uintptr_t addr, uintptr_t end)
 {
-    pthread_mutex_lock(&g_anon_lock);
-    for (int i = 0; i < g_nanon; i++) {                      /* replace anything this overlaps */
-        uintptr_t a = g_anon[i].addr, e = a + g_anon[i].len;
-        if ((uintptr_t)addr < e && (uintptr_t)addr + len > a) { g_anon[i] = g_anon[--g_nanon]; i--; }
-    }
-    if (anon_room()) { g_anon[g_nanon].addr = (uintptr_t)addr; g_anon[g_nanon].len = len; g_nanon++; }
-    pthread_mutex_unlock(&g_anon_lock);
-}
-
-/*
- * Forget [addr, addr+len) once it is unmapped, or the table fills with ranges that are gone and a later MADV_DONTNEED
- * would map fresh pages over whatever has since taken their place. munmap takes whole pages, so the range is rounded
- * out to them; an entry it cuts through keeps the part on either side.
- */
-static void anon_remove(uintptr_t addr, size_t len)
-{
-    uintptr_t end = addr + len;
-    end = end < addr ? UINTPTR_MAX : (end + 16383 < end ? UINTPTR_MAX : (end + 16383) & ~(uintptr_t)16383);
-    addr &= ~(uintptr_t)16383;
-    pthread_mutex_lock(&g_anon_lock);
     for (int i = 0; i < g_nanon; i++) {
         uintptr_t a = g_anon[i].addr, e = a + g_anon[i].len;
         if (addr >= e || end <= a) continue;
@@ -428,6 +409,29 @@ static void anon_remove(uintptr_t addr, size_t len)
             g_anon[i] = g_anon[--g_nanon]; i--;
         }
     }
+}
+
+/* A new mapping replaces only what it covers: one placed inside a bigger region leaves the rest of that region recorded. */
+static void anon_add(void *addr, size_t len)
+{
+    pthread_mutex_lock(&g_anon_lock);
+    anon_cut_locked((uintptr_t)addr, (uintptr_t)addr + len);
+    if (anon_room()) { g_anon[g_nanon].addr = (uintptr_t)addr; g_anon[g_nanon].len = len; g_nanon++; }
+    pthread_mutex_unlock(&g_anon_lock);
+}
+
+/*
+ * Forget [addr, addr+len) once it is unmapped, or the table fills with ranges that are gone and a later MADV_DONTNEED
+ * would map fresh pages over whatever has since taken their place. munmap takes whole pages, so the range is rounded
+ * out to them.
+ */
+static void anon_remove(uintptr_t addr, size_t len)
+{
+    uintptr_t end = addr + len;
+    end = end < addr ? UINTPTR_MAX : (end + 16383 < end ? UINTPTR_MAX : (end + 16383) & ~(uintptr_t)16383);
+    addr &= ~(uintptr_t)16383;
+    pthread_mutex_lock(&g_anon_lock);
+    anon_cut_locked(addr, end);
     pthread_mutex_unlock(&g_anon_lock);
 }
 
