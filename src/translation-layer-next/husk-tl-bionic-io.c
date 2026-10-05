@@ -792,6 +792,7 @@ static long futex_call(uint32_t *addr, int op, uint32_t val, const struct timesp
 }
 
 static long linux_syscall_impl(long a0, long a1, long a2, long a3, long a4, long a5, long nr, void *lr);
+static long sys_path(long nr, long a0, long a1, long a2, long a3, long a4);
 long tl_linux_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long nr)
 {
     static int trace = -1;
@@ -824,7 +825,7 @@ static long sys_kill(long nr, long a0, long a1, long a2, void *lr)
 
 static long linux_syscall_impl(long a0, long a1, long a2, long a3, long a4, long a5, long nr, void *lr)
 {
-    (void)a4; (void)a5;
+    (void)a5;
     switch (nr) {
     case 178: { uint64_t t = 0; pthread_threadid_np(NULL, &t); return (long)t; }       /* gettid */
     case 172: return getpid();
@@ -833,11 +834,10 @@ static long linux_syscall_impl(long a0, long a1, long a2, long a3, long a4, long
     case 176: case 177: return getgid();
     case 98:  return futex_call((uint32_t *)a0, (int)a1, (uint32_t)a2, (const struct timespec *)a3, (uint32_t)a5);
     case 129: case 130: case 131: return sys_kill(nr, a0, a1, a2, lr);                 /* kill, tkill, tgkill */
-    case 56: {                                                                          /* openat: only AT_FDCWD */
-        if ((int)a0 != -100) return -38;
-        int fd = b_open((const char *)a1, (int)a2, (unsigned)a3);
-        return fd < 0 ? -*tl_guest_errno_ptr() : fd;
-    }
+    /* Every call that takes a path goes through the same confinement as the libc wrappers (sys_path). */
+    case 17: case 34: case 35: case 36: case 37: case 38: case 43: case 45: case 48: case 49: case 53: case 56:
+    case 78: case 79: case 88: case 276: case 439:
+        return sys_path(nr, a0, a1, a2, a3, a4);
     case 57: { int r = close((int)a0); return r < 0 ? -tl_errno_to_guest(errno) : r; }
     case 63: { long r = read((int)a0, (void *)a1, (size_t)a2); return r < 0 ? -tl_errno_to_guest(errno) : r; }
     case 64: { long r = write((int)a0, (const void *)a1, (size_t)a2); return r < 0 ? -tl_errno_to_guest(errno) : r; }
@@ -998,6 +998,87 @@ static long b_pathconf(const char *p, int name)
 {
     (void)p;
     switch (name) { case 3: return 255; case 4: return 4096; case 5: return 4096; case 6: return 0x10000; default: return -1; }
+}
+
+/*
+ * Raw system calls that name a path: getcwd, mkdirat, unlinkat, symlinkat, linkat, renameat(2), statfs, truncate,
+ * faccessat(2), chdir, fchmodat, openat, readlinkat, newfstatat, utimensat. They were ENOSYS (openat alone was
+ * answered, for AT_FDCWD only) because answering them with Darwin's own calls would hand the kernel paths nothing
+ * had checked; they are answered by the libc wrappers above, which confine every path (tl_path_at for a directory
+ * descriptor, then tl_path_confine), and the wrapper's -1 and errno become the system call's -errno.
+ */
+#define G_AT_EMPTY_PATH 0x1000
+static int sys_fstatat(int dirfd, const char *path, guest_stat *st, int flags)
+{
+    if ((flags & G_AT_EMPTY_PATH) && path && !path[0]) return b_fstat(dirfd, st);
+    char b[PATH_MAX]; const char *p = tl_path_at(dirfd, path, b, sizeof(b));
+    if (!p) return -1;
+    return (flags & G_AT_SYMLINK_NOFOLLOW) ? b_lstat(p, st) : b_stat(p, st);
+}
+static int sys_renameat(int od, const char *op, int nd, const char *np, unsigned flags)
+{
+    char a[PATH_MAX], b[PATH_MAX], x[PATH_MAX], y[PATH_MAX];
+    const char *p = tl_path_at(od, op, a, sizeof(a)), *q = p ? tl_path_at(nd, np, b, sizeof(b)) : NULL;
+    if (!q || !tl_path_confine(p, TL_PATH_WRITE | TL_PATH_NOFOLLOW, x, sizeof(x)) || !tl_path_confine(q, TL_PATH_WRITE | TL_PATH_NOFOLLOW, y, sizeof(y))) return -1;
+    if (flags & ~1u) { tl_set_guest_errno(22); return -1; }          /* RENAME_EXCHANGE, RENAME_WHITEOUT: not provided */
+    TL_ERRNO_BEGIN();
+    int r = flags ? renamex_np(x, y, RENAME_EXCL) : rename(x, y);      /* RENAME_NOREPLACE */
+    TL_ERRNO_END();
+    return r;
+}
+static long sys_path_call(long nr, long a0, long a1, long a2, long a3, long a4)
+{
+    char b[PATH_MAX], c[PATH_MAX];
+    const char *p, *q;
+    int dfd = (int)a0;
+    switch (nr) {
+    case 17: {                                                        /* getcwd: the length, terminator included */
+        if (!a0) { tl_set_guest_errno(14); return -1; }
+        char *r = tl_path_getcwd((char *)a0, (size_t)a1);
+        return r ? (long)strlen(r) + 1 : -1;
+    }
+    case 34: p = tl_path_at(dfd, (const char *)a1, b, sizeof(b)); return p ? b_mkdir(p, (unsigned)a2) : -1;
+    case 35: return b_unlinkat(dfd, (const char *)a1, (int)a2);
+    case 36: p = tl_path_at((int)a1, (const char *)a2, b, sizeof(b)); return p ? b_symlink((const char *)a0, p) : -1;
+    case 37:                                                          /* linkat: the flags (AT_SYMLINK_FOLLOW) are not honoured */
+        p = tl_path_at(dfd, (const char *)a1, b, sizeof(b));
+        q = p ? tl_path_at((int)a2, (const char *)a3, c, sizeof(c)) : NULL;
+        return q ? b_link(p, q) : -1;
+    case 38: return sys_renameat(dfd, (const char *)a1, (int)a2, (const char *)a3, 0);
+    case 276: return sys_renameat(dfd, (const char *)a1, (int)a2, (const char *)a3, (unsigned)a4);
+    case 43: return b_statfs((const char *)a0, (guest_statfs *)a1);
+    case 45: return b_truncate((const char *)a0, a1);
+    case 48: case 439:                                                /* faccessat(2): AT_EACCESS and AT_SYMLINK_NOFOLLOW are not honoured */
+        p = tl_path_at(dfd, (const char *)a1, b, sizeof(b)); return p ? b_access(p, (int)a2) : -1;
+    case 49: return b_chdir((const char *)a0);
+    case 53: return b_fchmodat(dfd, (const char *)a1, (unsigned)a2, 0);
+    case 56: return b_openat(dfd, (const char *)a1, (int)a2, (unsigned)a3);
+    case 78: p = tl_path_at(dfd, (const char *)a1, b, sizeof(b)); return p ? b_readlink(p, (char *)a2, (size_t)a3) : -1;
+    case 79: return sys_fstatat(dfd, (const char *)a1, (guest_stat *)a2, (int)a3);
+    case 88:
+        if (!a1) {                                                    /* no path: the descriptor itself, as futimens */
+            const struct timespec *ts = (const struct timespec *)a2;
+            struct timespec d[2];
+            if (ts) for (int i = 0; i < 2; i++) {
+                d[i] = ts[i];
+                if (ts[i].tv_nsec == 0x3fffffff) d[i].tv_nsec = UTIME_NOW; else if (ts[i].tv_nsec == 0x3ffffffe) d[i].tv_nsec = UTIME_OMIT;
+            }
+            TL_ERRNO_BEGIN(); int r = futimens(dfd, ts ? d : NULL); TL_ERRNO_END(); return r;
+        }
+        return b_utimensat(dfd, (const char *)a1, (const struct timespec *)a2, (int)a3);
+    }
+    tl_set_guest_errno(38);
+    return -1;
+}
+static long sys_path(long nr, long a0, long a1, long a2, long a3, long a4)
+{
+    /* A raw system call reports its error in its result and leaves errno alone, which the wrappers do not. */
+    int *ep = tl_guest_errno_ptr(), saved = *ep;
+    *ep = 0;
+    long r = sys_path_call(nr, a0, a1, a2, a3, a4);
+    if (r < 0) r = *ep ? -(long)*ep : -5 /* EIO: a failure that named no cause */;
+    *ep = saved;
+    return r;
 }
 
 const tl_bionic_entry tl_tab_io2[] = {
