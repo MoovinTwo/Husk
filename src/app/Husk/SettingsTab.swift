@@ -563,6 +563,7 @@ struct SavedMachineSettings: View {
         UserDefaults.standard.object(forKey: "husk.autoSave") as? Bool ?? true
     @State private var useSnapshot =
         UserDefaults.standard.object(forKey: "husk.downloadSnapshot") as? Bool ?? true
+    @State private var forceSnapshot = UserDefaults.standard.bool(forKey: "husk.forceSnapshot")
     @State private var askWhichToDelete = false
     @State private var deleteResult: String?
 
@@ -613,6 +614,20 @@ struct SavedMachineSettings: View {
                 Text("Adds about 2 GB to the first download. It was captured on the "
                    + "software renderer, so it is not used on GPU — which cold-boots "
                    + "once and then saves its own.")
+            }
+
+            Section {
+                Toggle("Use the snapshot even if it may not fit", isOn: $forceSnapshot)
+                    .onChange(of: forceSnapshot) { v in
+                        UserDefaults.standard.set(v, forKey: "husk.forceSnapshot")
+                        HuskLog.log("ui", v ? "forcing the pre-booted snapshot"
+                                            : "pre-booted snapshot only when it fits")
+                    }
+            } footer: {
+                Text("The snapshot needs a fixed amount of RAM, and on phones without "
+                   + "room for it Husk boots from cold instead. Forcing it may still "
+                   + "work where guest RAM can be backed by a file, but if it does not, "
+                   + "iOS closes the app as Android starts. Applies from the next launch.")
             }
         }
         .huskForm()

@@ -66,7 +66,23 @@ typedef struct tl_dual_mapping {
     size_t   size;
 } tl_dual_mapping;
 
+/* The size to prewarm the StikDebug region with when the translation layer gets
+ * there before the app has. Prewarm is one-shot, so this has to be the full
+ * size: a smaller region leaves no room for QEMU's tb-size carve once anything
+ * here has taken a slice. Must match HUSK_JIT_REGION_BYTES in
+ * src/ios-jit/husk-ios-jit.h (not included: that library is found by dlsym)
+ * and JITBootstrap.jitBytes in src/app/Husk/JITBootstrap.swift. */
+#define TL_JIT_REGION_BYTES ((size_t)512 * 1024 * 1024)
+
+/* The whole StikDebug region, prewarming it first if nothing has yet; NULL when
+ * there is none. Its bounds are for range checks: space in it is taken with
+ * tl_jit_carve(), because QEMU and both loaders all draw from it. */
 tl_dual_mapping *tl_find_stikdebug_prewarmed(void);
+
+/* Take `bytes` (rounded up to 16 KiB pages) from that region through the JIT
+ * library's shared allocator. False when there is no region, the allocator is
+ * not linked into this process, or the slice does not fit. */
+bool tl_jit_carve(size_t bytes, uint8_t **rx, uint8_t **rw);
 
 /* ------------------------------------------------------------------- ZIP */
 

@@ -617,6 +617,11 @@ wanted = [
     "husk_snapshot_load_at_startup",
     "husk_balloon_set_bytes",
     "husk_ios_jit_prewarm",
+    # The translation layer finds these with dlsym. Left unexported, dlsym
+    # finds nothing and the loaders fall back to MAP_JIT, which TXM refuses.
+    "husk_ios_jit_carve",
+    "husk_ios_jit_get_mapping",
+    "husk_ios_jit_remaining",
     "husk_ios_jit_install_trap_handler",
     "husk_ios_jit_is_available",
     "husk_ios_jit_mapjit_works",

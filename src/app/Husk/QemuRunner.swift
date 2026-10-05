@@ -626,6 +626,14 @@ final class QemuRunner: ObservableObject {
                 try? String(QemuRunner.pendingSnapshotMiB)
                     .write(toFile: QemuRunner.shared.snapshotSizePath,
                            atomically: true, encoding: .utf8)
+                // This save went into the slot the shipped snapshot occupied.
+                // If this launch cold-booted instead of using it, the shipped
+                // markers now describe a machine that is gone; left in place,
+                // a roomier launch would restore this save into the shipped
+                // snapshot's pinned RAM size.
+                if !QemuRunner.usesShippedSnapshot {
+                    GuestImage.shared.retireShippedSnapshot()
+                }
                 try? QemuRunner.memoryStrategy
                     .write(toFile: QemuRunner.shared.memoryStrategyPath,
                            atomically: true, encoding: .utf8)
@@ -697,10 +705,31 @@ final class QemuRunner: ObservableObject {
         // machine. Folding the display choice into the strategy means the first
         // launch after GL starts working boots cold once, then re-snapshots,
         // rather than failing to restore.
-        GuestImage.shared.hasShippedSnapshot
+        QemuRunner.usesShippedSnapshot
             ? "shipped-snapshot-v10"
             : "file-backed-lineage-v2-" + QemuRunner.machineStamp
     }
+
+    /// Whether this launch is built around the shipped snapshot.
+    ///
+    /// Decided once per process. RAM, CPU, vCPU count, resolution, the memory
+    /// strategy and the restore itself each ask, and whether the snapshot fits
+    /// depends on available memory, which moves between those questions. A
+    /// machine assembled from two different answers -- pinned at the snapshot's
+    /// RAM but refusing to restore it, say -- would be neither machine.
+    nonisolated static var usesShippedSnapshot: Bool { shippedSnapshotDecision }
+    private static let shippedSnapshotDecision: Bool = {
+        let guest = GuestImage.shared
+        let use = guest.usableShippedSnapshot
+        if guest.hasShippedSnapshot, !use {
+            let room = QemuRunner.anonymousGuestBudget().map { "\($0.headroomMiB) MiB" }
+                ?? "an unknown amount"
+            HuskLog.log("qemu", "the shipped snapshot needs \(guest.snapshotPins.mib) MiB "
+                              + "and this phone has room for \(room); booting from cold "
+                              + "at a size that fits instead")
+        }
+        return use
+    }()
 
     /// Whether guest RAM can be backed by a file on this device, this run.
     ///
@@ -884,7 +913,7 @@ final class QemuRunner: ObservableObject {
 
         // A shipped snapshot fixes the resolution: it was saved against one,
         // and a machine whose display differs is a different machine.
-        if GuestImage.shared.hasShippedSnapshot, !QemuRunner.landscapeGuest {
+        if QemuRunner.usesShippedSnapshot, !QemuRunner.landscapeGuest {
             // From the manifest the snapshot was published with, not a constant
             // compiled into this build -- an app older than a snapshot cannot
             // know the machine it was saved on.
@@ -908,19 +937,70 @@ final class QemuRunner: ObservableObject {
     }
 
     private var machineCpu: String {
-        GuestImage.shared.hasShippedSnapshot ? GuestImage.shared.snapshotPins.cpu
-                                            : GuestImage.defaultCpu
+        QemuRunner.usesShippedSnapshot ? GuestImage.shared.snapshotPins.cpu
+                                       : GuestImage.defaultCpu
     }
     private var machineSmp: Int {
-        GuestImage.shared.hasShippedSnapshot ? GuestImage.shared.snapshotPins.smp
-                                            : GuestImage.defaultSmp
+        QemuRunner.usesShippedSnapshot ? GuestImage.shared.snapshotPins.smp
+                                       : GuestImage.defaultSmp
+    }
+
+    // os_proc_available_memory() is the real ceiling, not a floor. Budgeting
+    // 40% of physical RAM instead -- a 3426 MiB guest -- got the app
+    // jetsammed 85 seconds in, the footprint falling cleanly from 2082 MiB
+    // of headroom to 178 MiB before the log simply stopped. Death came just
+    // past 3400 MiB, against the 3376 MiB this call reported at launch.
+    //
+    // It is accurate because a guest's RAM is dirty anonymous memory, which
+    // is exactly what it measures. QEMU's resident size is a high-water mark
+    // of guest page touches: once the guest dirties a page it stays resident
+    // even after the guest frees it, so the peak is what kills us and it
+    // cannot be walked back. Another app reaching a larger number does not
+    // transfer -- clean file-backed pages are evictable and charged
+    // differently.
+    // The region the app claims, not tb-size: prewarm takes
+    // JITBootstrap.jitBytes, and QEMU carves its tb-size slice out of it.
+    static let jitRegionMiB = JITBootstrap.jitBytes / (1024 * 1024)
+    static let qemuOverheadMiB = 750 // measured, not guessed
+    // Real margin, in megabytes rather than a fraction. A fraction of what
+    // was left quietly cost ~375 MiB the guest could have had; the run that
+    // booted Android peaked with ~500 MiB spare, so this is the same shape
+    // of safety without the waste.
+    static let safetyMarginMiB = 450
+
+    /// Guest RAM that fits as anonymous memory beside the JIT and QEMU itself,
+    /// before any clamping, or nil when iOS will not say what is available.
+    ///
+    /// One copy of this arithmetic, because two questions depend on it: how
+    /// large a cold-booted guest may be, and whether a snapshot pinned to a
+    /// fixed size can be restored at all. Answered separately they would drift,
+    /// and the app would download a snapshot it then cannot restore.
+    nonisolated static func anonymousGuestBudget() -> (availableMiB: Int, headroomMiB: Int)? {
+        let availableMiB = Int(husk_ios_available_memory() / (1024 * 1024))
+        guard availableMiB > 0 else { return nil }
+        // The JIT is only subtracted if it has not been taken yet. Prewarming
+        // claims it before this runs, so os_proc_available_memory() has already
+        // fallen by that much -- subtracting again charged for it twice and cut
+        // the guest from 1906 MiB to 1650.
+        //
+        // Not yet taken, it is charged at the size prewarm will claim, not at
+        // tb-size. The update check asks this before prewarm, and charging the
+        // 256 MiB tb-size there overstated headroom by 256 MiB -- enough to
+        // download a snapshot the launch-time check then refused. If prewarm
+        // fails outright, QEMU maps its own tb-size buffer instead and this
+        // over-charges by the difference; erring that way only costs headroom.
+        let jitStillToCome = JITBootstrap.prewarmed ? 0 : jitRegionMiB
+        return (availableMiB,
+                availableMiB - safetyMarginMiB - jitStillToCome - qemuOverheadMiB)
     }
 
     private func guestMemoryMiB() -> Int {
         // Same reasoning as the resolution: the shipped snapshot was saved with
         // exactly this much RAM, and QEMU rejects a restore that differs by a
-        // byte. No probing, no stepping down -- this number or nothing.
-        if GuestImage.shared.hasShippedSnapshot {
+        // byte. No probing, no stepping down -- this number or nothing. A
+        // snapshot too large for this phone is not used at all, and the machine
+        // is sized below as though it were not there.
+        if QemuRunner.usesShippedSnapshot {
             let mib = GuestImage.shared.snapshotPins.mib
             QemuRunner.shared.lastGuestMiB = mib
             HuskLog.log("qemu", "using the shipped snapshot: guest pinned to \(mib) MiB")
@@ -947,45 +1027,25 @@ final class QemuRunner: ObservableObject {
            let recorded = try? String(contentsOfFile: snapshotSizePath, encoding: .utf8),
            let mib = Int(recorded.trimmingCharacters(in: .whitespacesAndNewlines)), mib > 0 {
             HuskLog.log("qemu", "snapshot exists; using its guest size of \(mib) MiB")
+            // Recorded like every other size. The restore is only attempted when
+            // this matches the saved size, and the next save records it -- left
+            // at zero, a machine saved after a cold boot never restored, and the
+            // save after that wrote 0 over its size.
+            QemuRunner.shared.lastGuestMiB = mib
             return mib
         }
 
         let physMiB = Int(ProcessInfo.processInfo.physicalMemory / (1024 * 1024))
-        let availableMiB = Int(husk_ios_available_memory() / (1024 * 1024))
+        let jitMiB = QemuRunner.jitRegionMiB
+        let qemuOverheadMiB = QemuRunner.qemuOverheadMiB
+        let safetyMarginMiB = QemuRunner.safetyMarginMiB
 
-        // os_proc_available_memory() is the real ceiling, not a floor. Budgeting
-        // 40% of physical RAM instead -- a 3426 MiB guest -- got the app
-        // jetsammed 85 seconds in, the footprint falling cleanly from 2082 MiB
-        // of headroom to 178 MiB before the log simply stopped. Death came just
-        // past 3400 MiB, against the 3376 MiB this call reported at launch.
-        //
-        // It is accurate because a guest's RAM is dirty anonymous memory, which
-        // is exactly what it measures. QEMU's resident size is a high-water mark
-        // of guest page touches: once the guest dirties a page it stays resident
-        // even after the guest frees it, so the peak is what kills us and it
-        // cannot be walked back. Another app reaching a larger number does not
-        // transfer -- clean file-backed pages are evictable and charged
-        // differently.
-        let jitMiB = 256          // tb-size
-        let qemuOverheadMiB = 750 // measured, not guessed
-        // Real margin, in megabytes rather than a fraction. A fraction of what
-        // was left quietly cost ~375 MiB the guest could have had; the run that
-        // booted Android peaked with ~500 MiB spare, so this is the same shape
-        // of safety without the waste.
-        let safetyMarginMiB = 450
-
-        guard availableMiB > 0 else {
+        guard let budget = QemuRunner.anonymousGuestBudget() else {
             HuskLog.log("qemu", "available memory unknown; falling back to 1536 MiB guest")
             return 1536
         }
-
-        // The JIT is only subtracted if it has not been taken yet. Prewarming
-        // claims it before this runs, so os_proc_available_memory() has already
-        // fallen by that much -- subtracting again charged for it twice and cut
-        // the guest from 1906 MiB to 1650.
-        let jitStillToCome = JITBootstrap.prewarmed ? 0 : jitMiB
-        let anonymousTarget = max(1024, min(6144,
-            availableMiB - safetyMarginMiB - jitStillToCome - qemuOverheadMiB))
+        let availableMiB = budget.availableMiB
+        let anonymousTarget = max(1024, min(6144, budget.headroomMiB))
 
         // With a file-backed RAM block the arithmetic above is the wrong shape:
         // it measures room for pages that must stay resident, and these do not
@@ -1034,9 +1094,12 @@ final class QemuRunner: ObservableObject {
 
         QemuRunner.shared.lastGuestMiB = target
         try? String(target).write(toFile: ramAttemptPath, atomically: true, encoding: .utf8)
+        // Hoisted: one more ternary in the concatenation below is the kind of
+        // thing that tips the type checker into "too complex".
+        let jitHeld = JITBootstrap.prewarmed ? " (already claimed)" : ""
         HuskLog.log("qemu", "memory budget: \(physMiB) MiB physical but "
                           + "\(availableMiB) MiB before jetsam -- that is the real "
-                          + "ceiling; reserving \(jitMiB) MiB JIT + \(qemuOverheadMiB) "
+                          + "ceiling; reserving \(jitMiB) MiB JIT\(jitHeld) + \(qemuOverheadMiB) "
                           + "MiB overhead + \(safetyMarginMiB) MiB margin; "
                           + "GUEST GETS \(target) MiB "
                           + (fileBackedTarget != nil
@@ -1456,7 +1519,7 @@ final class QemuRunner: ObservableObject {
         // differently: the shipped one stamps the generation it belongs to,
         // while a locally saved one records the guest size it was taken at.
         let snapshotFits: Bool
-        if GuestImage.shared.hasShippedSnapshot {
+        if QemuRunner.usesShippedSnapshot {
             snapshotFits = (QemuRunner.shared.lastGuestMiB == GuestImage.shared.snapshotPins.mib)
         } else {
             snapshotFits = (try? String(contentsOfFile: snapshotSizePath, encoding: .utf8))

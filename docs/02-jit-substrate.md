@@ -164,6 +164,29 @@ The integration work is therefore narrow: replace QEMU's own code-buffer allocat
 with one that calls `BreakGetJITMapping` + `vm_remap`, and let the rest of TCG's
 existing splitwx machinery work unmodified.
 
+## Who owns the region
+
+The app prewarms one region at launch (`husk_ios_jit_prewarm`, 512 MiB from
+`JITBootstrap.swift`), and that region is the only executable memory the process
+will ever have. Several clients want it: QEMU's translation buffer, the
+translation layer's old loader (`husk-tl-load.c`) and the native runtime
+(`husk-tl-xmem.c`). Each of them used to assume the region was its own and wrote
+from offset 0, so whichever ran second overwrote the first one's code.
+
+Nobody owns the whole region now. `husk-ios-jit.c` keeps a mutex-guarded bump
+allocator over it, and every client takes a disjoint slice with
+`husk_ios_jit_carve()`: QEMU gets exactly tb-size through
+`husk_ios_jit_allocate()`, and the loaders reach the allocator with `dlsym`
+(through `tl_jit_carve()`), since the JIT code lives in QEMU's library rather
+than in the app. `husk_ios_jit_get_mapping()` still returns the whole region, but
+only so callers can tell whether an address lies inside it. Slices are never
+given back, so the old loader's attempts use up space for the rest of the
+launch.
+
+The app also lets only one emulator run per launch: `ContentView` will not boot
+QEMU once a native game has started, and `TLUnityView` will not start a game
+while QEMU is running.
+
 ## Packaging gotcha, learned the expensive way
 
 `BreakpointJIT.framework` must **not** be linked by the Xcode target and must not

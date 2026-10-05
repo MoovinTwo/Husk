@@ -20,6 +20,22 @@ tl_dual_mapping *husk_ios_jit_get_mapping(void)
     return g_cli_dual.rx_addr ? &g_cli_dual : NULL;
 }
 
+/* Stands in for the JIT library's shared allocator, which the loader takes its
+ * space from: a plain bump over the mock region, in the same 16 KiB pages. */
+static size_t g_cli_dual_used;
+
+bool husk_ios_jit_carve(size_t bytes, uint8_t **rx, uint8_t **rw)
+{
+    size_t n = (bytes + 16383) & ~(size_t)16383;
+    if (!g_cli_dual.rx_addr || bytes == 0 || n > g_cli_dual.size - g_cli_dual_used) {
+        return false;
+    }
+    if (rx) *rx = g_cli_dual.rx_addr + g_cli_dual_used;
+    if (rw) *rw = g_cli_dual.rw_addr + g_cli_dual_used;
+    g_cli_dual_used += n;
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {

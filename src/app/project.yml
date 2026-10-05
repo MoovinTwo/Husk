@@ -20,6 +20,11 @@ settings:
     # dynamic-codesigning, which Apple will not provision; overriding this
     # rather than CODE_SIGN_ENTITLEMENTS keeps the override off the helper.
     HUSK_ENTITLEMENTS: Husk/Husk.entitlements
+    # The GitHub repository (owner/name) whose "lineage-v2" release carries the
+    # guest image, its pre-booted snapshot and manifest.json. A fork that
+    # publishes its own guest -- a smaller snapshot for a 6 GB phone, say --
+    # changes this. Reaches the app through Info.plist (GuestManifest.swift).
+    HUSK_RELEASES_REPO: Leviidev/Husk
     ARCHS: arm64
     ONLY_ACTIVE_ARCH: YES
     ENABLE_BITCODE: NO

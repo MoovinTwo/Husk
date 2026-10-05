@@ -56,7 +56,23 @@ struct GuestManifest: Codable, Equatable {
     let image: Image
     let snapshot: Snapshot
 
-    static let manifestURL = URL(string: "https://github.com/Leviidev/Husk/releases/"
+    /// The GitHub repository whose releases carry the guest, as a URL.
+    ///
+    /// A build setting rather than a literal, so a fork can publish its own
+    /// guest -- a snapshot pinned to less RAM, say -- without patching every
+    /// download URL. Set HUSK_RELEASES_REPO in project.yml; it reaches the app
+    /// through Info.plist. The fallback covers a build whose plist predates it.
+    static let releasesBase: String = {
+        let repo = (Bundle.main.object(forInfoDictionaryKey: "HuskReleasesRepo") as? String)?
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/ \n"))
+        // An unexpanded "$(...)" means the setting was missing at build time.
+        guard let repo, !repo.isEmpty, !repo.contains("$") else {
+            return "https://github.com/Leviidev/Husk"
+        }
+        return "https://github.com/" + repo
+    }()
+
+    static let manifestURL = URL(string: releasesBase + "/releases/"
                                        + "download/\(GuestImage.dependenciesTag)/manifest.json")!
 
     /// Fetch the manifest, or nil if it cannot be had.
@@ -93,7 +109,7 @@ struct GuestManifest: Codable, Equatable {
     }
 
     func url(for file: String) -> URL {
-        URL(string: "https://github.com/Leviidev/Husk/releases/download/"
+        URL(string: Self.releasesBase + "/releases/download/"
                   + "\(GuestImage.dependenciesTag)/\(file)")!
     }
 

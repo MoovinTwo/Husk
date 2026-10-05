@@ -20,6 +20,11 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 
+	<!-- Where the guest is downloaded from: owner/name of a GitHub repository,
+	     set as HUSK_RELEASES_REPO in project.yml. -->
+	<key>HuskReleasesRepo</key>
+	<string>$(HUSK_RELEASES_REPO)</string>
+
 	<key>CFBundleDisplayName</key>
 	<string>Husk</string>
 	<key>CFBundleShortVersionString</key>

@@ -504,8 +504,6 @@ static void jit_icache(void *p, size_t n)
 }
 #endif
 
-static size_t g_prewarmed_used = 0;
-
 static bool is_valid_dual_mapping(const tl_dual_mapping *m)
 {
     if (!m || !m->rw_addr || !m->rx_addr) return false;
@@ -516,55 +514,37 @@ static bool is_valid_dual_mapping(const tl_dual_mapping *m)
     return true;
 }
 
+/*
+ * The region is found through the JIT library's own accessor, looked up at run
+ * time because that library is QEMU's and is not linked against this one. It
+ * used to be found by reading a fixed offset from husk_ios_jit_prewarm and by
+ * decoding that function's machine code, both of which depend on the exact
+ * build of the library and break without a word when it is rebuilt.
+ */
 tl_dual_mapping *tl_find_stikdebug_prewarmed(void)
 {
+    /* Ensure prewarm has been called in case this attempt ran before QEMU.
+     * Prewarm is one-shot, so this must ask for the full region the app would
+     * have: a smaller one leaves QEMU's tb-size carve no room. */
+    bool (*prewarm_fn)(size_t) = (bool (*)(size_t))dlsym(RTLD_DEFAULT, "husk_ios_jit_prewarm");
+    if (prewarm_fn) {
+        prewarm_fn(TL_JIT_REGION_BYTES);
+    }
+
     tl_dual_mapping *(*get_fn)(void) = (tl_dual_mapping *(*)(void))dlsym(RTLD_DEFAULT, "husk_ios_jit_get_mapping");
     if (get_fn) {
         tl_dual_mapping *m = get_fn();
         if (is_valid_dual_mapping(m)) return m;
     }
-
-    /* Ensure prewarm has been called in case this attempt ran before QEMU. */
-    bool (*prewarm_fn)(size_t) = (bool (*)(size_t))dlsym(RTLD_DEFAULT, "husk_ios_jit_prewarm");
-    if (prewarm_fn) {
-        prewarm_fn(256 * 1024 * 1024);
-    }
-
-    void *fn = dlsym(RTLD_DEFAULT, "husk_ios_jit_prewarm");
-    if (!fn) return NULL;
-
-    /* 1. Try static offset in libqemu-aarch64-softmmu.dylib (_husk_prewarmed is at 0x1ce6920, prewarm at 0x35d788) */
-    tl_dual_mapping *m = (tl_dual_mapping *)((uintptr_t)fn + 0x1989198);
-    if (is_valid_dual_mapping(m)) {
-        return m;
-    }
-
-    /* 2. Decode the specific adrp+ldr right before epilogue (instruction 36) */
-    const uint32_t *p = (const uint32_t *)fn;
-    for (int i = 30; i < 50; i++) {
-        uint32_t insn = p[i];
-        if ((insn & 0x9F000000u) == 0x90000000u) { /* adrp */
-            uint32_t next = p[i + 1];
-            if ((next & 0xFFC00000u) == 0xF9400000u) { /* ldr Xt, [Xn, #imm] */
-                uint32_t rd = insn & 0x1Fu;
-                uint32_t rn = (next >> 5) & 0x1Fu;
-                if (rd == rn) {
-                    uint64_t immlo = (insn >> 29) & 3u;
-                    uint64_t immhi = (insn >> 5) & 0x7FFFFu;
-                    int64_t imm = (int64_t)((immhi << 2) | immlo);
-                    if (imm & 0x100000) imm -= 0x200000;
-                    uintptr_t pc = (uintptr_t)&p[i];
-                    uintptr_t page = (pc & ~0xFFFull) + (imm << 12);
-                    uint64_t pimm = ((next >> 10) & 0xFFFu) << 3;
-                    tl_dual_mapping *cand = (tl_dual_mapping *)(page + pimm);
-                    if (is_valid_dual_mapping(cand)) {
-                        return cand;
-                    }
-                }
-            }
-        }
-    }
     return NULL;
+}
+
+bool tl_jit_carve(size_t bytes, uint8_t **rx, uint8_t **rw)
+{
+    if (!tl_find_stikdebug_prewarmed()) return false;
+    bool (*carve_fn)(size_t, uint8_t **, uint8_t **) =
+        (bool (*)(size_t, uint8_t **, uint8_t **))dlsym(RTLD_DEFAULT, "husk_ios_jit_carve");
+    return carve_fn && carve_fn(bytes, rx, rw);
 }
 
 /* ------------------------------------------------------------------ ELF  */
@@ -1278,12 +1258,11 @@ static bool load_library(const char *name, const uint8_t *file, size_t flen)
     uint8_t *base_rw = NULL;
     bool is_stikdebug = false;
 
-    if (stik && stik->rw_addr && stik->rx_addr) {
+    /* Carved, not taken from the region's start: QEMU and the native runtime
+     * hold slices of the same region, and nothing is given back on unload. */
+    if (stik) {
         size_t need = npages * TL_PAGE;
-        if (g_prewarmed_used + need <= stik->size) {
-            base = stik->rx_addr + g_prewarmed_used;
-            base_rw = stik->rw_addr + g_prewarmed_used;
-            g_prewarmed_used += need;
+        if (tl_jit_carve(need, &base, &base_rw)) {
             is_stikdebug = true;
             tl_log_line("jit: using StikDebug dual mapping (rx=%p rw=%p, %zu KiB)",
                         base, base_rw, need / 1024);
@@ -1989,7 +1968,6 @@ void husk_tl_attempt_reset(void)
         unmap_lib(&g_run.libs[i]);
         free(g_run.libs[i].file);
     }
-    g_prewarmed_used = 0;
     tl_window_release(g_run.window);
     tl_shim_free(g_run.queue);
     tl_shim_free(g_run.assets);
