@@ -218,7 +218,9 @@ static jobj *proxy_call(jobj *proxy, const char *iface, const char *name, const 
         jobj *arr2 = tl_jni_new_obj_array(C("java/lang/Object"), (uint32_t)nargs);
         for (int i = 0; i < nargs; i++) arr2->oarr.v[i] = tl_jni_ref(args[i]);
         jobj *nm = tl_jni_new_string(name);
-        jobj *r2 = pf(tl_jni_env(), tl_jni_class_object("com/unity3d/player/ReflectionHelper"), tl_jni_get_field(proxy, "handle", "J").j, nm, arr2);
+        jobj *r2;
+        /* What the native returns is a local of its frame; the caller gets a reference of its own. */
+        TL_JNI_NATIVE_CALL(r2 = tl_jni_ref(pf(tl_jni_env(), tl_jni_class_object("com/unity3d/player/ReflectionHelper"), tl_jni_get_field(proxy, "handle", "J").j, nm, arr2)));
         if (tl_jni_pending()) tl_jni_clear();
         tl_jni_unref(nm); tl_jni_unref(arr2);
         return r2;
@@ -230,7 +232,8 @@ static jobj *proxy_call(jobj *proxy, const char *iface, const char *name, const 
     jobj *arr = tl_jni_new_obj_array(C("java/lang/Object"), (uint32_t)nargs);
     for (int i = 0; i < nargs; i++) arr->oarr.v[i] = tl_jni_ref(args[i]);
     int64_t handle = tl_jni_get_field(proxy, "handle", "J").j;
-    jobj *r = fn(tl_jni_env(), tl_jni_class_object("bitter/jnibridge/JNIBridge"), handle, icls, method, arr);
+    jobj *r;
+    TL_JNI_NATIVE_CALL(r = tl_jni_ref(fn(tl_jni_env(), tl_jni_class_object("bitter/jnibridge/JNIBridge"), handle, icls, method, arr)));
     if (tl_jni_pending()) tl_jni_clear();
     tl_jni_unref(method);
     tl_jni_unref(arr);
@@ -300,8 +303,9 @@ static void *looper_thread(void *arg)
 static looper *current_or_main(void) { return t_looper ? t_looper : main_looper(); }
 static looper *looper_of(const jobj *o) { return o && o->native ? o->native : NULL; }
 
-static void Looper_getMainLooper(tl_jcall *c) { c->ret = vl(main_looper()->mirror); }
-static void Looper_myLooper(tl_jcall *c) { c->ret = vl(t_looper ? t_looper->mirror : NULL); }
+/* A looper keeps its own reference to its mirror; what a method returns is a new one for the caller. */
+static void Looper_getMainLooper(tl_jcall *c) { c->ret = vl(tl_jni_ref(main_looper()->mirror)); }
+static void Looper_myLooper(tl_jcall *c) { c->ret = vl(t_looper ? tl_jni_ref(t_looper->mirror) : NULL); }
 static void Looper_quit(tl_jcall *c)
 {
     looper *l = looper_of(c->self);
@@ -317,7 +321,7 @@ static void HT_init(tl_jcall *c)
     c->self->native = l;
 }
 static void HT_start(tl_jcall *c) { looper *l = looper_of(c->self); if (l) looper_start(l); }
-static void HT_getLooper(tl_jcall *c) { looper *l = looper_of(c->self); c->ret = vl(l ? l->mirror : NULL); }
+static void HT_getLooper(tl_jcall *c) { looper *l = looper_of(c->self); c->ret = vl(l ? tl_jni_ref(l->mirror) : NULL); }
 static void HT_quit(tl_jcall *c) { Looper_quit(c); c->ret = vz(1); }
 
 /* ------------------------------------------------------------ Message */
@@ -378,7 +382,7 @@ static void Handler_init0(tl_jcall *c)  { handler_init(c, NULL, NULL); }
 static void Handler_initL(tl_jcall *c)  { handler_init(c, looper_of(c->args[0].l), NULL); }
 static void Handler_initC(tl_jcall *c)  { handler_init(c, NULL, c->args[0].l); }
 static void Handler_initLC(tl_jcall *c) { handler_init(c, looper_of(c->args[0].l), c->args[1].l); }
-static void Handler_getLooper(tl_jcall *c) { handler *h = c->self->native; c->ret = vl(h ? h->lp->mirror : NULL); }
+static void Handler_getLooper(tl_jcall *c) { handler *h = c->self->native; c->ret = vl(h ? tl_jni_ref(h->lp->mirror) : NULL); }
 
 static bool post_runnable(jobj *self, jobj *run, int64_t delay_ns)
 {
@@ -503,7 +507,7 @@ static void Choreo_getInstance(tl_jcall *c)
         l->choreographer->native = l;
         tl_jni_ref(l->choreographer);
     }
-    jobj *ch = l->choreographer;
+    jobj *ch = tl_jni_ref(l->choreographer);
     pthread_mutex_unlock(&l->mu);
     c->ret = vl(ch);
 }

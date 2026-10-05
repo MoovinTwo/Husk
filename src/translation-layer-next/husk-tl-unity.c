@@ -69,15 +69,16 @@ bool tl_unity_start(const tl_unity_config *cfg)
     tl_ld_init(main_lib);
     onload_fn onload = (onload_fn)tl_ld_sym(main_lib, "JNI_OnLoad");
     if (!onload) { tl_log_line("unity: libmain.so has no JNI_OnLoad"); return false; }
-    int32_t ver = onload(tl_jni_vm(), NULL);
+    int32_t ver;
+    TL_JNI_NATIVE_CALL(ver = onload(tl_jni_vm(), NULL));
     tl_log_line("unity: libmain JNI_OnLoad -> %#x", ver);
     if (tl_jni_pending()) { tl_log_line("unity: an exception is pending after libmain's JNI_OnLoad"); return false; }
 
     typedef uint8_t (*load_fn)(void *env, void *cls, void *dir);
     load_fn load = (load_fn)native_of("com/unity3d/player/NativeLoader", "load", "(Ljava/lang/String;)Z");
     if (!load) return false;
-    jobj *dir = tl_jni_new_string("/data/app/lib/arm64");
-    uint8_t ok = load(tl_jni_env(), tl_jni_class_object("com/unity3d/player/NativeLoader"), dir);
+    uint8_t ok;
+    TL_JNI_NATIVE_CALL(ok = load(tl_jni_env(), tl_jni_class_object("com/unity3d/player/NativeLoader"), tl_jni_local(tl_jni_new_string("/data/app/lib/arm64"))));
     tl_log_line("unity: NativeLoader.load -> %d", ok);
     return ok != 0;
 }
@@ -91,7 +92,7 @@ typedef void (*native_call_fn)(void *env, void *self, uintptr_t a, uintptr_t b);
 static void call_native_on(const char *cls, jobj *self, const char *name, const char *sig, uintptr_t a, uintptr_t b)
 {
     void *fn = native_of(cls, name, sig);
-    if (fn) ((native_call_fn)fn)(tl_jni_env(), self, a, b);
+    if (fn) TL_JNI_NATIVE_CALL(((native_call_fn)fn)(tl_jni_env(), self, a, b));
 }
 static void call_native(const char *name, const char *sig, uintptr_t a, uintptr_t b)
 {
@@ -125,7 +126,9 @@ static void *unity_main(void *arg)
         if (was_paused) { NATIVE_VOID("nativeResume", "()V", 0, 0); NATIVE_VOID("nativeFocusChanged", "(Z)V", 1, 0); was_paused = false; tl_log_line("unity: resumed"); }
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
-        uint8_t keep = ((uint8_t (*)(void *, void *))render)(tl_jni_env(), U.player);
+        uint8_t keep;
+        /* Each frame is a native call, whose locals go when it returns: the engine leaves most of them to that. */
+        TL_JNI_NATIVE_CALL(keep = ((uint8_t (*)(void *, void *))render)(tl_jni_env(), U.player));
         clock_gettime(CLOCK_MONOTONIC, &t1);
         {
             unsigned long long ns = (unsigned long long)((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec));
@@ -218,7 +221,7 @@ void tl_unity_touch(int phase, int id, float x, float y)
         T.n = 0;
     }
     pthread_mutex_unlock(&T.lock);
-    fn(tl_jni_env(), U.player, ev, 0);
+    TL_JNI_NATIVE_CALL(fn(tl_jni_env(), U.player, ev, 0));
     if (tl_jni_pending()) tl_jni_clear();
     tl_jni_unref(ev);
 }

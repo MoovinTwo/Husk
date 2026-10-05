@@ -233,7 +233,7 @@ static void ui_call_run(void *arg)
     typedef void (*fn_t)(void *env, void *self, int64_t cb);
     fn_t fn = (fn_t)tl_jni_native("com/mojang/minecraftpe/MainActivity", "nativeRunNativeCallbackOnUiThread", "(J)V");
     if (!fn) { tl_lib *lib = tl_ld_find_lib("libminecraftpe.so"); fn = lib ? (fn_t)tl_ld_sym(lib, "Java_com_mojang_minecraftpe_MainActivity_nativeRunNativeCallbackOnUiThread") : NULL; }
-    if (fn) fn(tl_jni_env(), M.activity, u->cb);
+    if (fn) TL_JNI_NATIVE_CALL(fn(tl_jni_env(), M.activity, u->cb));
     pthread_mutex_lock(&u->mu); u->done = true; pthread_cond_signal(&u->cv); pthread_mutex_unlock(&u->mu);
 }
 static void MA_runNativeCallbackOnUiThread(tl_jcall *c)
@@ -252,7 +252,7 @@ static void MA_requestIntegrityToken(tl_jcall *c)
     typedef void (*fn_t)(void *env, void *self, void *msg);
     tl_lib *lib = tl_ld_find_lib("libminecraftpe.so");
     fn_t fn = lib ? (fn_t)tl_ld_sym(lib, "Java_com_mojang_minecraftpe_MainActivity_nativeSetIntegrityTokenErrorMessage") : NULL;
-    if (fn) fn(tl_jni_env(), M.activity, STR("Play Integrity is not available"));
+    if (fn) TL_JNI_NATIVE_CALL(fn(tl_jni_env(), M.activity, tl_jni_local(STR("Play Integrity is not available"))));
 }
 
 /* ------------------------------------------------- HardwareInformation etc. */
@@ -299,21 +299,22 @@ static void store_job_run(void *arg)
     void *env = tl_jni_env();
     if (j->what == 0) {
         void (*fn)(void *, void *, int64_t, uint8_t) = store_native("onStoreInitialized");
-        if (fn) fn(env, j->listener, ptr, 1);
+        if (fn) TL_JNI_NATIVE_CALL(fn(env, j->listener, ptr, 1));
     } else if (j->what == 1) {
         void (*fn)(void *, void *, int64_t, void *) = store_native("onQueryPurchasesSuccess");
-        if (fn) fn(env, j->listener, ptr, tl_jni_new_obj_array(C("com/mojang/minecraftpe/store/Purchase"), 0));
+        if (fn) TL_JNI_NATIVE_CALL(fn(env, j->listener, ptr, tl_jni_local(tl_jni_new_obj_array(C("com/mojang/minecraftpe/store/Purchase"), 0))));
     } else {
         void (*fn)(void *, void *, int64_t, void *) = store_native("onQueryProductsSuccess");
-        if (fn) fn(env, j->listener, ptr, tl_jni_new_obj_array(C("com/mojang/minecraftpe/store/Product"), 0));
+        if (fn) TL_JNI_NATIVE_CALL(fn(env, j->listener, ptr, tl_jni_local(tl_jni_new_obj_array(C("com/mojang/minecraftpe/store/Product"), 0))));
     }
+    tl_jni_unref(j->listener);
     free(j);
 }
 static void store_post(jobj *store, int what)
 {
     jobj *l = store ? tl_jni_get_field(store, "listener", "Ljava/lang/Object;").l : NULL;
     if (!l) return;
-    store_job *j = malloc(sizeof(*j)); j->listener = l; j->what = what;
+    store_job *j = malloc(sizeof(*j)); j->listener = tl_jni_ref(l); j->what = what;      /* the job outlives the call */
     tl_ga_post(store_job_run, j);
 }
 
@@ -342,7 +343,7 @@ static void XAL_randomBytes(tl_jcall *c)
     if (n > 0) arc4random_buf(a->arr.data, (size_t)n);
     c->ret = vl(a);
 }
-static void XAL_appContext(tl_jcall *c) { c->ret = vl(M.activity); }
+static void XAL_appContext(tl_jcall *c) { c->ret = vl(tl_jni_ref(M.activity)); }
 static void XAL_locale(tl_jcall *c) { c->ret = vl(STR("en-US")); }
 static void Playfab_uuid(tl_jcall *c) { char u[40]; new_uuid(u, true); c->ret = vl(STR(u)); }
 static void DateTime_is24(tl_jcall *c) { c->ret = vz(0); }
@@ -523,7 +524,7 @@ void tl_mc_hle_install(const char *pkg, const char *apk, const char *data, int w
 void tl_mc_set_activity(jobj *activity)
 {
     M.activity = activity;
-    jvalue v; v.j = 0; v.l = activity;
+    jvalue v; v.j = 0; v.l = tl_jni_ref(activity);
     tl_jni_set_static("com/mojang/minecraftpe/MainActivity", "mInstance", "Lcom/mojang/minecraftpe/MainActivity;", v);
     tl_jni_set_static("com/mojang/minecraftpe/MainActivity", "mHasStoragePermission", "Z", vz(1));
 }

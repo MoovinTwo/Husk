@@ -156,26 +156,27 @@ static void *ui_main(void *arg)
     snprintf(obb, sizeof(obb), "%s/obb", G.data);
     snprintf(ext, sizeof(ext), "%s/sdcard/Android/data/%s/files", G.data, G.pkg);
     tl_log_line("minecraft: initializeNativeCode");
-    G.handle = init(env, activity, tl_jni_new_string(files), tl_jni_new_string(obb), tl_jni_new_string(ext), tl_hle_assets(), NULL, tl_hle_config());
+    TL_JNI_NATIVE_CALL(G.handle = init(env, activity, tl_jni_local(tl_jni_new_string(files)), tl_jni_local(tl_jni_new_string(obb)), tl_jni_local(tl_jni_new_string(ext)),
+                                       tl_hle_assets(), NULL, tl_hle_config()));
     tl_log_line("minecraft: initializeNativeCode -> %#llx", (unsigned long long)G.handle);
     if (!G.handle || tl_jni_pending()) { tl_log_line("minecraft: the game's native code did not initialise"); return NULL; }
 
     typedef void (*set_input_fn)(void *env, void *self, int64_t h, void *conn);
     set_input_fn set_input = (set_input_fn)GA_NATIVE("setInputConnectionNative", "(JLcom/google/androidgamesdk/gametextinput/InputConnection;)V");
-    if (set_input) set_input(env, activity, G.handle, tl_jni_new_object(tl_jni_class("com/google/androidgamesdk/gametextinput/InputConnection")));
+    if (set_input) TL_JNI_NATIVE_CALL(set_input(env, activity, G.handle, tl_jni_local(tl_jni_new_object(tl_jni_class("com/google/androidgamesdk/gametextinput/InputConnection")))));
 
     /* MainActivity.onCreate, after super.onCreate: the Java crash manager is set up by the game's own thread,
      * and the UI thread waits for it to say so. */
     typedef void (*wait_fn)(void *env, void *cls);
     wait_fn wait = (wait_fn)MAIN_NATIVE("nativeWaitCrashManagementSetupComplete", "()V");
-    if (wait) { tl_log_line("minecraft: waiting for the crash manager setup"); wait(env, tl_jni_class_object(CLS_MAIN)); tl_log_line("minecraft: crash manager setup complete"); }
+    if (wait) { tl_log_line("minecraft: waiting for the crash manager setup"); TL_JNI_NATIVE_CALL(wait(env, tl_jni_class_object(CLS_MAIN))); tl_log_line("minecraft: crash manager setup complete"); }
 
     typedef void (*life_fn)(void *env, void *self, int64_t h);
     life_fn on_start = (life_fn)GA_NATIVE("onStartNative", "(J)V");
     life_fn on_resume = (life_fn)GA_NATIVE("onResumeNative", "(J)V");
-    if (on_start) on_start(env, activity, G.handle);
+    if (on_start) TL_JNI_NATIVE_CALL(on_start(env, activity, G.handle));
     tl_log_line("minecraft: onStart done");
-    if (on_resume) on_resume(env, activity, G.handle);
+    if (on_resume) TL_JNI_NATIVE_CALL(on_resume(env, activity, G.handle));
     tl_log_line("minecraft: onResume done");
 
     typedef void (*surf_fn)(void *env, void *self, int64_t h, void *surface);
@@ -184,18 +185,19 @@ static void *ui_main(void *arg)
     surf_fn created = (surf_fn)GA_NATIVE("onSurfaceCreatedNative", "(JLandroid/view/Surface;)V");
     surf_changed_fn changed = (surf_changed_fn)GA_NATIVE("onSurfaceChangedNative", "(JLandroid/view/Surface;III)V");
     focus_fn focus = (focus_fn)GA_NATIVE("onWindowFocusChangedNative", "(JZ)V");
-    if (created) created(env, activity, G.handle, surface);
+    if (created) TL_JNI_NATIVE_CALL(created(env, activity, G.handle, surface));
     tl_log_line("minecraft: surface created");
-    if (changed) changed(env, activity, G.handle, surface, 1 /* PixelFormat.RGBA_8888 */, G.cfg.width, G.cfg.height);
+    if (changed) TL_JNI_NATIVE_CALL(changed(env, activity, G.handle, surface, 1 /* PixelFormat.RGBA_8888 */, G.cfg.width, G.cfg.height));
     tl_log_line("minecraft: surface changed %dx%d", G.cfg.width, G.cfg.height);
-    if (focus) focus(env, activity, G.handle, 1);
+    if (focus) TL_JNI_NATIVE_CALL(focus(env, activity, G.handle, 1));
     tl_log_line("minecraft: focus gained");
 
     /* The message loop: the looper serves what the game's native glue registered on it (its main-work pipe), and
      * the jobs posted with tl_ga_post run in between. */
     int (*poll_once)(int, int *, int *, void **) = tl_bionic_find("ALooper_pollOnce");
     for (;;) {
-        poll_once(50, NULL, NULL, NULL);
+        /* On Android this is MessageQueue.nativePollOnce, a native method: what the callbacks it runs leave as locals goes when it returns. */
+        TL_JNI_NATIVE_CALL(poll_once(50, NULL, NULL, NULL));
         for (;;) {
             pthread_mutex_lock(&UI.mu);
             ui_job *j = UI.head;
@@ -238,8 +240,8 @@ static void touch_run(void *arg)
                                 uint64_t action_button, uint64_t button_state, uint64_t classification, uint64_t edge_flags,
                                 float precision_x, float precision_y);
     touch_fn fn = (touch_fn)GA_NATIVE("onTouchEventNative", "(JLandroid/view/MotionEvent;IIIIIJJIIIIIIFF)Z");
-    if (fn && G.handle) fn(tl_jni_env(), G.activity, G.handle, t->ev, t->pointers, 0, 0, 0x1002 /* SOURCE_TOUCHSCREEN */, (uint64_t)t->action,
-                           t->event_ms, t->down_ms, 0, 0, 0, 0, 0, 0, 1.0f, 1.0f);
+    if (fn && G.handle) TL_JNI_NATIVE_CALL(fn(tl_jni_env(), G.activity, G.handle, t->ev, t->pointers, 0, 0, 0x1002 /* SOURCE_TOUCHSCREEN */, (uint64_t)t->action,
+                                              t->event_ms, t->down_ms, 0, 0, 0, 0, 0, 0, 1.0f, 1.0f));
     tl_jni_unref(t->ev);
     free(t);
 }
@@ -299,14 +301,14 @@ static void pause_run(void *arg)
     void *env = tl_jni_env();
     if (!G.handle) return;
     if (pause) {
-        if (focus) focus(env, G.activity, G.handle, 0);
-        if (on_pause) on_pause(env, G.activity, G.handle);
-        if (on_stop) on_stop(env, G.activity, G.handle);
+        if (focus) TL_JNI_NATIVE_CALL(focus(env, G.activity, G.handle, 0));
+        if (on_pause) TL_JNI_NATIVE_CALL(on_pause(env, G.activity, G.handle));
+        if (on_stop) TL_JNI_NATIVE_CALL(on_stop(env, G.activity, G.handle));
         tl_log_line("minecraft: paused");
     } else {
-        if (on_start) on_start(env, G.activity, G.handle);
-        if (on_resume) on_resume(env, G.activity, G.handle);
-        if (focus) focus(env, G.activity, G.handle, 1);
+        if (on_start) TL_JNI_NATIVE_CALL(on_start(env, G.activity, G.handle));
+        if (on_resume) TL_JNI_NATIVE_CALL(on_resume(env, G.activity, G.handle));
+        if (focus) TL_JNI_NATIVE_CALL(focus(env, G.activity, G.handle, 1));
         tl_log_line("minecraft: resumed");
     }
 }

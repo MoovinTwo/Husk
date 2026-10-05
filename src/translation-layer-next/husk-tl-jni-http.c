@@ -115,9 +115,13 @@ static void UWR_run(tl_jcall *c)
     const size_t CHUNK = 128 * 1024;
     uint8_t *chunk = malloc(CHUNK), *body = NULL; size_t body_len = 0;
     jobj *buf = direct_buffer(chunk, (int64_t)CHUNK);
-    if (upload(env, cls, u->ptr, NULL) > 0) {
+    /* Each callback is a native call of its own, with its own locals: the strings made for it go with it. */
+    int more;
+    TL_JNI_NATIVE_CALL(more = upload(env, cls, u->ptr, NULL));
+    if (more > 0) {
         for (;;) {
-            int n = upload(env, cls, u->ptr, buf);
+            int n;
+            TL_JNI_NATIVE_CALL(n = upload(env, cls, u->ptr, buf));
             if (n <= 0) break;
             body = realloc(body, body_len + (size_t)n);
             memcpy(body + body_len, chunk, (size_t)n);
@@ -137,19 +141,21 @@ static void UWR_run(tl_jcall *c)
     tl_log_line("http: %s %s (%zu bytes sent)", u->method, u->url, body_len);
     if (!tl_http_perform(&rq, &rs)) {
         tl_log_line("http: %s failed: %s", u->url, rs.message);
-        error(env, cls, u->ptr, rs.error, tl_jni_new_string(rs.message));
+        TL_JNI_NATIVE_CALL(error(env, cls, u->ptr, rs.error, tl_jni_local(tl_jni_new_string(rs.message))));
     } else {
         long content_length = -1;
         for (int i = 0; i < rs.nheaders; i++) {
-            header(env, cls, u->ptr, tl_jni_new_string(rs.header_names[i]), tl_jni_new_string(rs.header_values[i]));
+            TL_JNI_NATIVE_CALL(header(env, cls, u->ptr, tl_jni_local(tl_jni_new_string(rs.header_names[i])), tl_jni_local(tl_jni_new_string(rs.header_values[i]))));
             if (!strcasecmp(rs.header_names[i], "content-length")) content_length = atol(rs.header_values[i]);
         }
-        length(env, cls, u->ptr, (int)(content_length >= 0 ? content_length : (long)rs.body_len));
-        status(env, cls, u->ptr, rs.status);
+        TL_JNI_NATIVE_CALL(length(env, cls, u->ptr, (int)(content_length >= 0 ? content_length : (long)rs.body_len)));
+        TL_JNI_NATIVE_CALL(status(env, cls, u->ptr, rs.status));
         for (size_t off = 0; off < rs.body_len;) {
             size_t n = rs.body_len - off < CHUNK ? rs.body_len - off : CHUNK;
             memcpy(chunk, rs.body + off, n);
-            if (!download(env, cls, u->ptr, buf, (int)n)) break;
+            uint8_t go;
+            TL_JNI_NATIVE_CALL(go = download(env, cls, u->ptr, buf, (int)n));
+            if (!go) break;
             off += n;
         }
         tl_log_line("http: %s -> %d (%zu bytes)", u->url, rs.status, rs.body_len);
