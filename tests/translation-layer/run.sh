@@ -14,7 +14,7 @@
 #
 # Needs clang and lld (with the Android targets, which upstream clang has),
 # python3 and zlib's headers. Step 3 also needs aarch64-linux-gnu-gcc and
-# qemu-aarch64, and is skipped without them.
+# qemu-aarch64 (or qemu-aarch64-static), and is skipped without them.
 set -eu
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -63,8 +63,9 @@ else
 fi
 
 echo "== device checks, arm64 under qemu-user"
-if ! command -v aarch64-linux-gnu-gcc >/dev/null || ! command -v qemu-aarch64 >/dev/null; then
-    echo "skipped: needs aarch64-linux-gnu-gcc and qemu-aarch64"
+QEMU_AARCH64=$(command -v qemu-aarch64 || command -v qemu-aarch64-static || true)
+if ! command -v aarch64-linux-gnu-gcc >/dev/null || [ -z "$QEMU_AARCH64" ]; then
+    echo "skipped: needs aarch64-linux-gnu-gcc and qemu-aarch64 (or qemu-aarch64-static)"
     exit 0
 fi
 # The checks do not touch ZIP files, so the scanner's zlib is stubbed out
@@ -80,15 +81,32 @@ void *husk_tl_read_entry(const char *a, const char *b, size_t l, size_t *o)
 void *tl_find_stikdebug_prewarmed(void) { return NULL; }
 bool tl_jit_carve(size_t n, uint8_t **rx, uint8_t **rw) { (void)n; (void)rx; (void)rw; return false; }
 EOF
+# The probe also reaches into the loader for the debugger-granted (StikDebug)
+# JIT region. There is none under qemu-user, so these stubs report "no region"
+# and the dualmap check takes its skip path, as on a device without StikDebug.
+cat > "$OUT/noload.c" <<'EOF'
+#include "husk-tl-internal.h"
+tl_dual_mapping *tl_find_stikdebug_prewarmed(void) { return NULL; }
+bool tl_jit_carve(size_t bytes, uint8_t **rx, uint8_t **rw)
+{ (void)bytes; *rx = NULL; *rw = NULL; return false; }
+EOF
+# check_dualmap() calls Apple's sys_icache_invalidate() directly; give it the
+# portable equivalent so the probe builds for arm64 Linux.
+cat > "$OUT/icache.h" <<'EOF'
+#include <stddef.h>
+static inline void sys_icache_invalidate(void *p, size_t n)
+{ __builtin___clear_cache((char *)p, (char *)p + n); }
+EOF
 aarch64-linux-gnu-gcc $CFLAGS -static -o "$OUT/checks_arm64" "$HERE/scan_cli.c" \
-    "$OUT/noscan.c" "$SRC"/husk-tl-json.c "$SRC"/husk-tl-probe.c \
+    "$OUT/noscan.c" "$OUT/noload.c" "$SRC"/husk-tl-json.c \
+    -include "$OUT/icache.h" "$SRC"/husk-tl-probe.c \
     -Wl,--defsym=husk_tl_free=free -lpthread
-python3 - "$OUT/checks_arm64" <<'EOF'
+python3 - "$OUT/checks_arm64" "$QEMU_AARCH64" <<'EOF'
 import json, subprocess, sys
-cli = sys.argv[1]
+cli, qemu = sys.argv[1], sys.argv[2]
 failures = 0
 def run(*args):
-    out = subprocess.run(["qemu-aarch64", cli, "checks", *args], check=True,
+    out = subprocess.run([qemu, cli, "checks", *args], check=True,
                          capture_output=True, text=True).stdout
     return {c["id"]: c for c in json.loads(out)}
 def check(what, cond, detail=""):
