@@ -1,10 +1,21 @@
 # The translation layer: Android apps without booting Android
 
-Status: **experimental, first stretch built.** Settings › Experimental › Android
-Translation Layer exists. Apps can be added there and each gets a report of
-what running it would take, and the phone can be asked the questions the design
-depends on. **Nothing opens an app yet.** The rest of Husk is unaffected either
-way.
+Status: **experimental; three game engines wired up.** Settings › Experimental › Android
+Translation Layer exists. Apps can be added there, each gets a report of what
+running it would take, and the phone can be asked the questions the design
+depends on. Games built on three engines -- Unity IL2CPP (Subway Surfers),
+cocos2d-x (Geometry Dash) and GameActivity (Minecraft) -- are launched through
+the native runtime in `src/translation-layer-next`, and the older prototype's
+Dex interpreter was built to run one simple pure-Java game. Other apps do not
+open. Device results are not recorded in this repository; the commit messages
+say where each game was run.
+The rest of Husk is unaffected either way. See [Milestones](#milestones) for
+what is and is not done, and [Two layers](#two-layers) for which code does what.
+
+The design discussion below (ATL, the option choice, the hard problems) was
+written before the native runtime existed and is kept because its reasoning
+still holds; some sections note where the runtime answered a question
+differently.
 
 Sources read for this document, September 2026:
 
@@ -80,11 +91,14 @@ Husk links `libqemu-aarch64-softmmu.dylib` into its own process today. A
 process that also loads ART is one combined work containing GPLv2-only and
 Apache-2.0 code, which nobody can distribute.
 
-What this change does about it: **everything under `src/translation-layer/` is
-Husk's own code, GPL-2.0-or-later, and none of it comes from ATL or AOSP.** It is
-compiled into the app, not into the QEMU library. Nothing licence-sensitive
-ships yet. The decision is needed **before milestone 2**, the first time ART
-enters the build. The realistic choices:
+What this change does about it: **everything under `src/translation-layer/` and
+`src/translation-layer-next/` is Husk's own code, GPL-2.0-or-later, and none of
+it comes from ATL or AOSP.** It is compiled into the app, not into the QEMU
+library. The native runtime does not use ART at all -- it answers JNI from C
+(see below) -- so nothing licence-sensitive ships yet, and the app refuses to
+start a native game while QEMU is running in the same process lifetime
+(`TLUnityView.swift`). The decision is still needed **before ART, ATL or AOSP
+code enters the build**. The realistic choices:
 
 1. **A separate build of Husk without QEMU** for the translation layer.
    Unambiguous.
@@ -229,21 +243,24 @@ for `aarch64-linux-gnu` and never for `aarch64-linux-android` or
 shadow call stacks, and possibly libraries from older compilers, would. The
 `x18` check measures whether XNU preserves it.
 
-### Direct system calls: counted, open
+### Direct system calls: counted; rewritten by the native runtime
 
 bionic makes system calls itself, so the shim replaces them wholesale. But some
 code issues `svc #0` with Linux numbers inline (Go's runtime, some anti-tamper
 code), and iOS would treat those as Darwin calls. The scanner counts `svc`
-instructions per library. The loader will have to patch each one into a call to
-the shim.
+instructions per library. The native runtime's loader (`husk-tl-ld.c`) patches
+each `svc` site into a branch to a stub that calls its Linux system-call
+handler; a site with no stub in branch range is answered with `ENOSYS`.
 
-### bionic on Darwin's libc: open
+### bionic on Darwin's libc: shimmed by the native runtime
 
 This is the largest mechanical part of the loader. Structure layouts (`stat`,
 `dirent`, `sigaction`), `errno` values, `open`/`mmap` flags, signal numbers,
 `pthread_mutex_t` sizes (40 bytes on bionic arm64, 64 on Darwin), and bionic's
 `__sF` stdio all differ. The scanner's per-app "Android libraries it needs"
-list is the list of what has to be provided.
+list is the list of what has to be provided. The native runtime provides the
+part the three supported engines use, in `husk-tl-bionic*.c`; other apps
+will find gaps.
 
 ### Guest file paths: confined
 
@@ -273,14 +290,60 @@ temporary data directory they make.
 Apple's CPUs have not executed AArch32 code since the A11. An APK with only
 `armeabi-v7a` libraries would need a CPU emulator, and the scanner says so.
 
-### ART: open
+### ART: open, and not used by the native runtime
 
 Built for `arm64-apple-ios`, with `kPageSize` = 16 KiB. It starts
 interpreter-only: `-Xusejit:false`, and no boot-image dex2oat (ATL's README
 gives the same workaround for Apple Silicon Linux). The JIT follows once the
 code cache sits on Husk's RW/RX pair.
 
-## TLS roots
+## Two layers
+
+There are two implementations in the tree. They share the APK reader and the
+JIT region, and nothing else.
+
+**The prototype, `src/translation-layer/`** (from `a87c5bd` onward). The
+scanner and device checks, and the "attempt" in `husk-tl-load.c`: it loads an
+APK's arm64 libraries into the JIT region against a small shim
+(`husk-tl-shim.c`) and drives a `NativeActivity` lifecycle into a software
+window. An APK with no arm64 libraries, or none exporting
+`ANativeActivity_onCreate`, goes instead to a Dalvik interpreter
+(`husk-tl-dex.c`) with hand-written framework shims (`husk-tl-framework.c`,
+`husk-tl-res.c`, `husk-tl-prefs.c`) and a software Canvas (`husk-tl-blit.c`);
+that path runs a Flappy Bird clone (`fe0085d`). Its design and limits are in
+[05-dex-interpreter.md](05-dex-interpreter.md).
+
+**The native runtime, `src/translation-layer-next/`** (from `8d05c43` onward).
+It runs games whose logic is native code, with no Java VM:
+
+- `husk-tl-ld.c`: a guest dynamic linker. Maps an APK's arm64 `.so` files into
+  the two-view executable region (`husk-tl-xmem.c`), relocates them with
+  Android's lookup order (each library's own scope first), binds imports to the
+  bionic shim, rewrites `mrs tpidr_el0` (above), x18 uses and inline `svc`
+  sites into stubs (`ea7140b`), and lays out static TLS.
+- `husk-tl-bionic*.c`: bionic's ABI on Darwin's libc -- I/O, pthreads, strings,
+  C++ runtime hooks, the NDK, sockets, and the path confinement above.
+- `husk-tl-jni*.c`: JNI over "a Java world in C". Framework classes are
+  implemented in C (`husk-tl-jni-hle.c` and per-engine files such as
+  `husk-tl-jni-cocos.c`, `husk-tl-jni-minecraft.c`, `husk-tl-jni-fmod.c`);
+  classes the APK defines are found through a DEX index (`husk-tl-dexindex.c`)
+  but their bytecode is never run.
+- `husk-tl-egl.c`: EGL/GLES over ANGLE on a `CAMetalLayer`, with an ES 3.1
+  shim (`husk-tl-egl-es31.inc`); `husk-tl-audio.c` for sound.
+- Engine drivers that do what each engine's Java shell would:
+  `husk-tl-unity.c` (UnityPlayer), `husk-tl-cocos.c` (cocos2d-x's
+  GLSurfaceView), `husk-tl-gameactivity.c` (the Android Game Development Kit's
+  GameActivity). `husk-tl-unity-app.c` is the app-facing entry point for all
+  three, called from `src/app/Husk/TLUnityView.swift`, which picks the engine
+  from the scanner's report (`TranslationLayer.swift`).
+- `husk-tl-http.m`/`husk-tl-jni-http.c`: UnityWebRequest over `NSURLSession`;
+  `husk-tl-jni-tls.c`: root certificates for engine TLS (see
+  [TLS roots](#tls-roots)).
+
+The prototype's loader is not used by the native runtime; the native runtime
+grew out of what the prototype's attempt found.
+
+### TLS roots
 
 Unity's mbedtls asks Java for the platform's trusted roots
 (`TrustManagerFactory` → `getAcceptedIssuers()`), and gets them from
@@ -301,33 +364,49 @@ stop verifying.
 
 ## Milestones
 
-| # | What | State |
-|---|---|---|
-| M0 | Setting, the translation layer's own APK store, per-app reports, device checks | **built** — host-tested; not yet run on a phone |
-| M1 | Device checks pass on hardware; the JIT substrate becomes its own library so the trap-servicer case can be measured too | not started |
-| M2 | ART for `arm64-apple-ios`, interpreter only, runs a `main()` from a Dex file in-process. **Licensing decision first.** | not started |
-| M3 | Husk's loader: an arm64 `.so` into JIT memory, relocated against a first bionic shim; `JNI_OnLoad` runs | not started |
-| M4 | Framework with a UIKit native half: a pure-Java app shows an Activity with text and buttons | not started |
-| M5 | GLES through ANGLE: a NativeActivity game draws | not started |
-| M6 | Audio, input, IME, storage, network | not started |
-| later | ART's JIT on the RW/RX pair; FEXCore for x86-only libraries | — |
+The original plan (M0-M6, built around porting ART) was overtaken: the native
+runtime skipped ART and went straight at native engines. What exists, by area,
+with the commits that introduced it:
 
-Nothing above M0 should be described as working until it has been seen working
-on hardware.
+| Area | State |
+|---|---|
+| Setting, APK store, per-app reports, device checks (`a87c5bd`) | **built**; host-tested by `tests/translation-layer/run.sh` |
+| Prototype loader + NativeActivity attempt (`742a554`, `16f9780`, `f9f3a9f`) | **built**; superseded by the native runtime |
+| Dex interpreter + framework shims, one pure-Java game (`91f7593`, `fe0085d`) | **built**, narrow; see [05-dex-interpreter.md](05-dex-interpreter.md) |
+| Guest linker and bionic shim (`8d05c43`), thread blocks and ELF TLS (`e668fc3`, `f0fd1a4`), path confinement (`4c8ca6e`) | **built** |
+| Unity IL2CPP: engine boots, JNI world, EGL over ANGLE (`5ea50e7`); Subway Surfers reaches gameplay on a Mac (`9fb9e0f`); in the app (`00ecffb`); networking (`774f1a0`) | **built** |
+| cocos2d-x: Geometry Dash with FMOD sound, text and keyboard (`a29839b`) | **built** |
+| GameActivity: Minecraft renders, plays, runs in the app with AAudio sound (`f519ae9`, `04b8adf`, `464263f`) | **built** |
+| ART, a general Java framework, apps that are not one of these engines | not started |
+| ART's JIT on the RW/RX pair; FEXCore for x86-only libraries | not started |
+
+"Built" means the code is in the tree and the commit says what it ran; it is
+not a compatibility claim. Host-side, only the prototype's scanner, page
+planner and device checks are covered by `tests/translation-layer/run.sh` (and
+CI, `.github/workflows/tests.yml`); the native runtime's harnesses in `tools/`
+(`unity-test.c`, `cocos-test.c`, `ga-test.c` and others) need a Mac and are not
+run automatically. Device results are not recorded in this repository.
 
 ## What exists now
 
-- `src/translation-layer/`, in C and compiled into the app:
+- `src/translation-layer/`, in C and compiled into the app (the prototype):
   - `husk-tl-zip.c`: an APK reader (ZIP, ZIP64, stored and deflated entries),
     written for untrusted input.
-  - `husk-tl-elf.c`: ELF analysis, including the 16 KiB page planner the loader
-    will reuse, and decoders for Android's packed relocations (APS2) and RELR.
-  - `husk-tl-scan.c`: the per-app report.
+  - `husk-tl-elf.c`: ELF analysis, including the 16 KiB page planner, and
+    decoders for Android's packed relocations (APS2) and RELR.
+  - `husk-tl-scan.c`: the per-app report, including the engine it was made
+    with.
   - `husk-tl-probe.c`: the device checks.
+  - `husk-tl-load.c`, `husk-tl-shim.c`: the attempt (see [Two layers](#two-layers)).
+  - `husk-tl-dex.c`, `husk-tl-framework.c`, `husk-tl-res.c`,
+    `husk-tl-prefs.c`, `husk-tl-blit.c`: the Dex interpreter and its framework.
+- `src/translation-layer-next/`: the native runtime (see [Two layers](#two-layers)).
 - `src/app/Husk/TranslationLayer.swift`: the setting, the APK store
   (`Documents/TranslationLayer/`, apart from Android's), the reports and the
-  checks screen.
-- `tests/translation-layer/run.sh`:
+  checks screen; `TLUnityView.swift`: the native runtime's game screen.
+- `tools/`: Mac harnesses for both layers (`tl-cli.c`, `dex-test.c`,
+  `native-test.c`, `unity-test.c`, `cocos-test.c`, `ga-test.c`, ...).
+- `tests/translation-layer/run.sh`, run in CI on every push and pull request:
   - the page planner on layouts worked out by hand;
   - the scanner on real arm64 Android libraries built by clang and lld, with
     relocation, import and stack-guard counts checked against `llvm-readelf`

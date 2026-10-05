@@ -159,3 +159,32 @@ forgotten:
 - **Google Play Services must not be bundled**, as the brief already states — the
   brief is right, and this is a licensing prohibition, not just a complexity
   argument.
+
+### The LineageOS guest is built outside this repository
+
+The Android guest the app downloads today (`vda-<version>.qcow2` and its
+snapshot, from the `lineage-v2` release of the repository named by
+`GuestManifest.releasesBase`; see `src/app/Husk/GuestImage.swift`) is LineageOS
+from [android-lineage-qemu](https://github.com/jqssun/android-lineage-qemu),
+modified for Husk. Some of those modifications are scripted here
+(`scripts/add_ethernet_feature.sh`, `scripts/set_grub_toggles.sh`), but the
+image build itself is not, and neither is the source of everything Husk adds to
+it -- in particular the `husk_agent` init service, the netcat listener on port
+5599 whose child is a shell in `u:r:shell:s0`, which the app's command bridge
+(`HuskBridgeFS.swift`, forwarded by `QemuRunner.swift`) talks to.
+
+Two consequences, both open:
+
+- **GPL corresponding source.** The image carries GPL components (the Linux
+  kernel above all, and any GPL-licensed userspace it contains). Distributing the image obliges whoever
+  publishes it to offer the corresponding source for those components, including
+  the build configuration and Husk's own additions. This repository does not
+  provide it today; it should either gain the guest's build source or link to
+  where it is, pinned to the exact revisions each published image was built
+  from.
+- **Security review.** The guest side of the command bridge -- what listens on
+  5599, which SELinux context it runs in, and what it accepts -- cannot be
+  reviewed from this repository. From the app side it is an unauthenticated
+  shell: QEMU forwards `127.0.0.1:5599` on the phone to it, so anything that
+  can connect to that port while the guest runs -- on the phone, or from inside
+  the guest -- should be assumed to get the same shell the app does.
