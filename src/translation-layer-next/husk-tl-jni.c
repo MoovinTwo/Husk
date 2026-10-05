@@ -111,41 +111,65 @@ void tl_jni_unref(jobj *o)
  * local recorded in it, and popping a frame releases them. The drivers push one around each call
  * into a native (TL_JNI_NATIVE_CALL) and PushLocalFrame pushes one for the guest. A thread that
  * calls JNI outside both, such as one the game started and attached, gets a base frame that is
- * released when it detaches; a thread that never detaches keeps its locals, as it does on Android.
- * Frames belong to their thread, so none of this needs a lock.
+ * released when it detaches. A thread that exits without detaching (a guest's exit ends its thread
+ * from inside a native call) releases every frame as it goes, through a pthread key's destructor;
+ * the frames hang off the key rather than __thread variables because that destructor may run after
+ * the thread's __thread storage is gone. Frames belong to their thread, so none of this needs a lock.
  */
 enum { LF_BASE, LF_HOST, LF_GUEST };
 typedef struct { jobj **v; uint32_t n, cap; uint8_t kind; } lframe;
-static __thread lframe *t_lf;                  /* slots stay allocated once used, for the next push */
-static __thread uint32_t t_nlf, t_caplf;
+typedef struct { lframe *f; uint32_t n, cap; } lstack;     /* frames stay allocated once used, for the next push */
+static pthread_key_t g_lstack_key;
+static pthread_once_t g_lstack_once = PTHREAD_ONCE_INIT;
 
-static void lf_push(uint8_t kind, uint32_t cap)
+static void lf_push(lstack *s, uint8_t kind, uint32_t cap)
 {
-    if (t_nlf == t_caplf) {
-        uint32_t n = t_caplf ? t_caplf * 2 : 8;
-        t_lf = realloc(t_lf, n * sizeof(*t_lf));
-        memset(t_lf + t_caplf, 0, (n - t_caplf) * sizeof(*t_lf));
-        t_caplf = n;
+    if (s->n == s->cap) {
+        uint32_t n = s->cap ? s->cap * 2 : 8;
+        s->f = realloc(s->f, n * sizeof(*s->f));
+        memset(s->f + s->cap, 0, (n - s->cap) * sizeof(*s->f));
+        s->cap = n;
     }
-    lframe *f = &t_lf[t_nlf++];
+    lframe *f = &s->f[s->n++];
     f->n = 0; f->kind = kind;
     if (cap > 4096) cap = 4096;                /* a hint; the frame grows past it anyway */
     if (f->cap < cap) { f->cap = cap; f->v = realloc(f->v, cap * sizeof(jobj *)); }
 }
 
-static void lf_pop(void)
+static void lf_pop(lstack *s)
 {
-    lframe *f = &t_lf[--t_nlf];
+    lframe *f = &s->f[--s->n];
     for (uint32_t i = 0; i < f->n; i++) tl_jni_unref(f->v[i]);
     f->n = 0;
+}
+
+/* Every frame goes, and its locals with it: at DetachCurrentThread, or as the thread exits. */
+static void lstack_free(void *p)
+{
+    lstack *s = p;
+    while (s->n) lf_pop(s);
+    for (uint32_t k = 0; k < s->cap; k++) free(s->f[k].v);
+    free(s->f);
+    free(s);
+}
+static void lstack_key(void) { pthread_key_create(&g_lstack_key, lstack_free); }
+
+/* This thread's frames: NULL before it has had any, unless `make`. */
+static lstack *lstack_here(bool make)
+{
+    pthread_once(&g_lstack_once, lstack_key);
+    lstack *s = pthread_getspecific(g_lstack_key);
+    if (!s && make) { s = calloc(1, sizeof(*s)); pthread_setspecific(g_lstack_key, s); }
+    return s;
 }
 
 jobj *tl_jni_local(jobj *o)
 {
     /* Class objects live as long as their class, so they are not worth a slot. */
     if (!o || o->kind == TL_K_CLASS) return o;
-    if (!t_nlf) lf_push(LF_BASE, 0);
-    lframe *f = &t_lf[t_nlf - 1];
+    lstack *s = lstack_here(true);
+    if (!s->n) lf_push(s, LF_BASE, 0);
+    lframe *f = &s->f[s->n - 1];
     if (f->n == f->cap) { f->cap = f->cap ? f->cap * 2 : 32; f->v = realloc(f->v, f->cap * sizeof(jobj *)); }
     f->v[f->n++] = o;
     return o;
@@ -154,33 +178,35 @@ jobj *tl_jni_local(jobj *o)
 /* Take `o` out of the innermost frame that holds it, without releasing it. False when no frame does. */
 static bool local_forget(jobj *o)
 {
-    for (uint32_t k = t_nlf; k-- > 0;) {
-        lframe *f = &t_lf[k];
+    lstack *s = lstack_here(false);
+    for (uint32_t k = s ? s->n : 0; k-- > 0;) {
+        lframe *f = &s->f[k];
         for (uint32_t i = f->n; i-- > 0;) if (f->v[i] == o) { f->v[i] = f->v[--f->n]; return true; }
     }
     return false;
 }
 
-void tl_jni_local_push(void) { lf_push(LF_HOST, 0); }
+void tl_jni_local_push(void) { lf_push(lstack_here(true), LF_HOST, 0); }
 
 void tl_jni_local_pop(void)
 {
     /* Down to the innermost frame a driver pushed: frames the guest pushed inside the call and never
      * popped go with it, as they do when an ART native method returns. */
-    uint32_t k = t_nlf;
-    while (k && t_lf[k - 1].kind != LF_HOST) k--;
+    lstack *s = lstack_here(false);
+    uint32_t k = s ? s->n : 0;
+    while (k && s->f[k - 1].kind != LF_HOST) k--;
     if (!k) return;
-    while (t_nlf >= k) lf_pop();
+    while (s->n >= k) lf_pop(s);
 }
 
 /* DetachCurrentThread: the thread's locals go. Not while a native call on it is still running, which ART refuses. */
 static void locals_detach(void)
 {
-    for (uint32_t k = 0; k < t_nlf; k++) if (t_lf[k].kind == LF_HOST) return;
-    while (t_nlf) lf_pop();
-    for (uint32_t k = 0; k < t_caplf; k++) free(t_lf[k].v);
-    free(t_lf);
-    t_lf = NULL; t_caplf = 0;
+    lstack *s = lstack_here(false);
+    if (!s) return;
+    for (uint32_t k = 0; k < s->n; k++) if (s->f[k].kind == LF_HOST) return;
+    pthread_setspecific(g_lstack_key, NULL);
+    lstack_free(s);
 }
 
 static tl_jclass *find_class_locked(const char *name)
@@ -652,14 +678,15 @@ static void jni_ExceptionDescribe(void *env)
 }
 static void jni_ExceptionClear(void *env) { (void)env; tl_jni_clear(); }
 static void jni_FatalError(void *env, const char *msg) { (void)env; tl_log_line("jni: FatalError: %s", msg); abort(); }
-static int32_t jni_PushLocalFrame(void *env, int32_t cap) { (void)env; lf_push(LF_GUEST, cap > 0 ? (uint32_t)cap : 0); return 0; }
+static int32_t jni_PushLocalFrame(void *env, int32_t cap) { (void)env; lf_push(lstack_here(true), LF_GUEST, cap > 0 ? (uint32_t)cap : 0); return 0; }
 static jo jni_PopLocalFrame(void *env, jo r)
 {
     (void)env;
     /* A pop with no frame of the guest's to match it would release the locals of the call it is in. */
-    if (!t_nlf || t_lf[t_nlf - 1].kind != LF_GUEST) { TRACE("jni: PopLocalFrame without a PushLocalFrame; ignored"); return r; }
+    lstack *s = lstack_here(false);
+    if (!s || !s->n || s->f[s->n - 1].kind != LF_GUEST) { TRACE("jni: PopLocalFrame without a PushLocalFrame; ignored"); return r; }
     tl_jni_ref(r);                              /* the result outlives its frame, as a local of the one outside */
-    lf_pop();
+    lf_pop(s);
     return tl_jni_local(r);
 }
 static jo jni_NewGlobalRef(void *env, jo o) { (void)env; return tl_jni_ref(o); }
