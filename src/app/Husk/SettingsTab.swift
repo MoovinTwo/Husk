@@ -437,6 +437,7 @@ struct JITSettings: View {
     @ObservedObject private var jit = JITCoordinator.shared
     @State private var autoStart = Onboarding.autoStart
     @State private var keepAttached = JITBootstrap.keepDebuggerAttached
+    @State private var jitRegionMiB = JITBootstrap.jitRegionMiB
 
     private var pairingLabel: String {
         switch jit.pairingSource {
@@ -478,6 +479,21 @@ struct JITSettings: View {
                        + builtInPairingNeed
                      : HuskBuiltInJIT.unavailableReason ?? "Built-in StikJIT needs LocalDevVPN and "
                        + builtInPairingNeed)
+            }
+
+            Section {
+                Picker("JIT memory", selection: $jitRegionMiB) {
+                    ForEach(JITBootstrap.jitRegionChoices, id: \.self) { Text("\($0) MiB").tag($0) }
+                }
+                .onChange(of: jitRegionMiB) { v in
+                    UserDefaults.standard.set(v, forKey: JITBootstrap.jitRegionKey)
+                    HuskLog.log("ui", "JIT region set to \(v) MiB from the next launch")
+                }
+            } footer: {
+                Text("512 MiB is needed for Minecraft; 256 MiB halves the setup work at each launch and is "
+                   + "enough for most Unity and cocos2d-x games. Takes effect next launch. Android also takes "
+                   + "\(QemuRunner.jitMiB) MiB from this memory, so at 256 MiB starting Android first leaves "
+                   + "none for native games until Husk is relaunched.")
             }
 
             Section {

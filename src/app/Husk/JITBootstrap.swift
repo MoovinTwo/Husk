@@ -53,7 +53,27 @@ enum JITBootstrap {
     // 512 MiB since the native runtime runs Minecraft: its main library alone is a 354 MiB image that has to sit in this
     // region, with the stubs the loader places beside it. A larger prewarm is safe for QEMU, which is handed the
     // prewarmed region whenever it is at least what tb-size asks for.
-    static let jitBytes = 512 * 1024 * 1024
+    //
+    // The size is a setting (Settings › JIT), 512 or 256 MiB. Each 16 KiB page costs a debugger round trip at
+    // attach, so 256 MiB halves that work at every launch, and most Unity and cocos2d-x games fit in it. QEMU and
+    // the native runtime carve from this one region: QEMU's tb-size (QemuRunner.jitMiB, 256) still fits at either
+    // size, but at 256 MiB a QEMU session that starts first takes all of it and leaves the native runtime none.
+    // It is read once per process, because the region is claimed once and cannot grow, so a change applies at the
+    // next launch.
+    static let jitBytes = jitRegionMiB * 1024 * 1024
+
+    /// UserDefaults key for the JIT region size, in MiB.
+    static let jitRegionKey = "husk.jitRegionMiB"
+    /// The sizes Settings offers, in MiB.
+    static let jitRegionChoices = [256, 512]
+    static let defaultJITRegionMiB = 512
+
+    /// The configured region size in MiB. Anything other than an offered size
+    /// (including nothing stored yet) is the default.
+    static var jitRegionMiB: Int {
+        let stored = UserDefaults.standard.integer(forKey: jitRegionKey)
+        return jitRegionChoices.contains(stored) ? stored : defaultJITRegionMiB
+    }
 
     /// True once the region is held. The memory budget needs this: after a
     /// prewarm the JIT is already counted in the footprint, so subtracting it
@@ -76,6 +96,10 @@ enum JITBootstrap {
         }
         HuskLog.log("jit", "claiming \(jitBytes / (1024 * 1024)) MiB of JIT memory now, "
                          + "before the guest download -- StikDebug does not stay attached")
+        if jitBytes / (1024 * 1024) <= QemuRunner.jitMiB {
+            HuskLog.log("jit", "the region is no larger than QEMU's tb-size (\(QemuRunner.jitMiB) MiB): "
+                             + "if Android starts first, native games get no JIT memory until Husk is relaunched")
+        }
         let ok = husk_ios_jit_prewarm(jitBytes)
         if ok {
             prewarmed = true
