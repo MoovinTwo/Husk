@@ -412,6 +412,10 @@ static int b_create(pthread_t *out, const guest_attr *attr, void *(*fn)(void *),
 static int b_kill(pthread_t t, int sig)
 {
     if (getenv("TL_SIGNAL_TRACE")) { char nm[32] = "", tn[32] = ""; pthread_getname_np(pthread_self(), nm, sizeof(nm)); pthread_getname_np(t, tn, sizeof(tn)); tl_log_line("signal[%s]: pthread_kill(%s, %d)", nm, tn, sig); }
+    if (sig != 0 && pthread_equal(t, pthread_self())) {   /* on itself: a fatal signal ends the guest, as raise() does */
+        char what[48]; snprintf(what, sizeof(what), "pthread_kill(self, %d)", sig);
+        return tl_guest_self_signal(sig, what, __builtin_return_address(0)) == 0 ? 0 : *tl_guest_errno_ptr();
+    }
     int d = tl_signal_to_darwin(sig);
     if (d < 0) return 22;
     return rc(pthread_kill(t, d));

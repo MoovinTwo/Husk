@@ -91,13 +91,13 @@ static unsigned b_umask(unsigned m) { return (unsigned)umask((mode_t)m); }
 static unsigned b_alarm(unsigned s) { (void)s; return 0; }
 static int b_mlock(const void *a, size_t n) { (void)a; (void)n; return 0; }
 
-/* The guest's kill() on its own process would take the whole app down; that is the guest asking to quit. */
+/* The guest's kill() on its own process with a fatal signal would take the whole app down; that is the guest asking to
+ * quit. Any other signal on itself is raised, as raise() does. */
 static int b_kill(int pid, int sig)
 {
     if (pid == getpid() && sig != 0) {
         char what[48]; snprintf(what, sizeof(what), "kill(self, %d)", sig);
-        tl_guest_fatal(128 + sig, what, __builtin_return_address(0));
-        return 0;
+        return tl_guest_self_signal(sig, what, __builtin_return_address(0));
     }
     int ds = sig == 0 ? 0 : tl_signal_to_darwin(sig);
     if (sig != 0 && ds <= 0) { tl_set_guest_errno(22); return -1; }

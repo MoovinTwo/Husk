@@ -54,6 +54,10 @@ extern void (*tl_guest_exit_hook)(int status);   /* set by an app host: exit() f
 /* abort(), _exit() or a fatal signal on itself from guest code: logs the caller (lr), then calls tl_guest_exit_hook
  * with status if one is set. Returns only when none is, and the caller then ends the process. */
 void tl_guest_fatal(int status, const char *what, void *lr);
+/* A Linux signal the guest sends its own process or thread: one Android dies of unhandled (ABRT, KILL, TERM, QUIT,
+ * SEGV, BUS, ILL, FPE, SYS) goes through tl_guest_fatal with 128 + sig first; then, as for any other, the Darwin
+ * equivalent is raised. Returns 0, or -1 with the guest's errno set. */
+int tl_guest_self_signal(int sig, const char *what, void *lr);
 
 void *tl_bionic_find(const char *name);
 bool  tl_bionic_is_system_lib(const char *soname);

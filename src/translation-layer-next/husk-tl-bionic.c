@@ -264,6 +264,27 @@ void tl_guest_fatal(int status, const char *what, void *lr)
     if (tl_guest_exit_hook) tl_guest_exit_hook(status);
 }
 
+/*
+ * A signal the guest sends itself: raise(), kill() or pthread_kill() aimed at its own process or thread, or the same
+ * through a raw system call. The signals Android kills the process with when nothing handles them end the guest
+ * through tl_guest_fatal. SIGTRAP is not among them: the app's brk guard owns it. Without a hook, or for any other
+ * signal, the Darwin equivalent is raised as before, which ends the process when the signal is a fatal one. Returns
+ * 0, or -1 with the guest's errno set, as raise() does.
+ */
+int tl_guest_self_signal(int sig, const char *what, void *lr)
+{
+    switch (sig) {
+    case 3: case 4: case 6: case 7: case 8: case 9: case 11: case 15: case 31:   /* QUIT ILL ABRT BUS FPE KILL SEGV TERM SYS */
+        tl_guest_fatal(128 + sig, what, lr);
+        break;
+    default: break;
+    }
+    int d = tl_signal_to_darwin(sig);
+    if (d < 0) { tl_set_guest_errno(22); return -1; }
+    TL_ERRNO_BEGIN(); int r = raise(d); TL_ERRNO_END();
+    return r;
+}
+
 static void guest_abort(const char *why)
 {
     char where[200];
