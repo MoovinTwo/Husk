@@ -747,16 +747,17 @@ static long futex_call(uint32_t *addr, int op, uint32_t val, const struct timesp
     return -38;
 }
 
-static long linux_syscall_impl(long a0, long a1, long a2, long a3, long a4, long a5, long nr);
+static long linux_syscall_impl(long a0, long a1, long a2, long a3, long a4, long a5, long nr, void *lr);
 long tl_linux_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long nr)
 {
     static int trace = -1;
     if (trace < 0) trace = getenv("TL_SYSCALL_TRACE") ? 1 : 0;
-    long r = linux_syscall_impl(a0, a1, a2, a3, a4, a5, nr);
+    long r = linux_syscall_impl(a0, a1, a2, a3, a4, a5, nr, __builtin_return_address(0));
     if (trace) tl_log_line("syscall %ld(%#lx, %#lx, %#lx) -> %ld", nr, a0, a1, a2, r);
     return r;
 }
-static long linux_syscall_impl(long a0, long a1, long a2, long a3, long a4, long a5, long nr)
+/* lr is where tl_linux_syscall was called from (the svc stubs' common path, or syscall()), for an exit's log line. */
+static long linux_syscall_impl(long a0, long a1, long a2, long a3, long a4, long a5, long nr, void *lr)
 {
     (void)a4; (void)a5;
     switch (nr) {
@@ -770,6 +771,13 @@ static long linux_syscall_impl(long a0, long a1, long a2, long a3, long a4, long
         int sig = nr == 131 ? (int)a2 : (int)a1;
         if (sig == 0) return 0;
         note_signal("kill/tgkill system call", sig);
+        uint64_t tid = 0; pthread_threadid_np(NULL, &tid);
+        int pid = getpid(), me = (int)tid;                                              /* the tid gettid answers, as an int */
+        int self = nr == 129 ? (int)a0 == pid : nr == 130 ? (int)a0 == me : (int)a0 == pid && (int)a1 == me;
+        if (self) {                                                                     /* on itself: as raise() */
+            char what[48]; snprintf(what, sizeof(what), "%s(self, %d) system call", nr == 129 ? "kill" : nr == 130 ? "tkill" : "tgkill", sig);
+            return tl_guest_self_signal(sig, what, lr) == 0 ? 0 : -*tl_guest_errno_ptr();
+        }
         int d = tl_signal_to_darwin(sig);
         if (d < 0) return -22;
         return raise(d) == 0 ? 0 : -3;
@@ -784,7 +792,8 @@ static long linux_syscall_impl(long a0, long a1, long a2, long a3, long a4, long
     case 64: { long r = write((int)a0, (const void *)a1, (size_t)a2); return r < 0 ? -tl_errno_to_guest(errno) : r; }
     case 113: { int r = clock_gettime(clock_to_darwin((int)a0), (struct timespec *)a1); return r < 0 ? -tl_errno_to_guest(errno) : 0; }
     case 169: return b_gettimeofday((int64_t *)a0, (void *)a1);
-    case 93: case 94: tl_log_line("bionic: exit(%ld) by raw system call", a0); exit((int)a0);
+    case 94: tl_guest_fatal((int)a0, "exit_group syscall", lr); exit((int)a0);            /* exit_group: the process */
+    case 93: tl_log_line("bionic: thread exit(%ld) by raw system call", a0); pthread_exit(NULL);   /* exit: the thread */
     case 278: arc4random_buf((void *)a0, (size_t)a1); return a1;                        /* getrandom */
     case 283: return 0;                                                                 /* membarrier */
     case 134: case 135: return 0;                                                       /* rt_sigaction, rt_sigprocmask: accepted */
