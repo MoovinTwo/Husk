@@ -375,10 +375,22 @@ static int prot_filter(int prot, const char *what)
  * and expect it to come back clean. Darwin's MADV_DONTNEED keeps the contents, so the pages are
  * replaced with fresh ones at the same protection instead.
  */
-#define MAX_ANON 4096
-static struct { uintptr_t addr; size_t len; } g_anon[MAX_ANON];
-static int g_nanon;
+typedef struct { uintptr_t addr; size_t len; } anon_range;
+static anon_range *g_anon;         /* grows: an allocator maps and unmaps all through a game's life */
+static int g_nanon, g_capanon;
 static pthread_mutex_t g_anon_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Room for one more entry, under g_anon_lock. When there is none to be had, the range goes unrecorded and
+ * MADV_DONTNEED on it keeps its contents, as Darwin's does; that is said once, and the table carries on. */
+static bool anon_room(void)
+{
+    if (g_nanon < g_capanon) return true;
+    int cap = g_capanon ? g_capanon * 2 : 1024;
+    anon_range *n = realloc(g_anon, (size_t)cap * sizeof(anon_range));
+    if (!n) { tl_note_once("mm: the table of anonymous mappings cannot grow; MADV_DONTNEED will not zero new ones"); return false; }
+    g_anon = n; g_capanon = cap;
+    return true;
+}
 
 static void anon_add(void *addr, size_t len)
 {
@@ -387,7 +399,35 @@ static void anon_add(void *addr, size_t len)
         uintptr_t a = g_anon[i].addr, e = a + g_anon[i].len;
         if ((uintptr_t)addr < e && (uintptr_t)addr + len > a) { g_anon[i] = g_anon[--g_nanon]; i--; }
     }
-    if (g_nanon < MAX_ANON) { g_anon[g_nanon].addr = (uintptr_t)addr; g_anon[g_nanon].len = len; g_nanon++; }
+    if (anon_room()) { g_anon[g_nanon].addr = (uintptr_t)addr; g_anon[g_nanon].len = len; g_nanon++; }
+    pthread_mutex_unlock(&g_anon_lock);
+}
+
+/*
+ * Forget [addr, addr+len) once it is unmapped, or the table fills with ranges that are gone and a later MADV_DONTNEED
+ * would map fresh pages over whatever has since taken their place. munmap takes whole pages, so the range is rounded
+ * out to them; an entry it cuts through keeps the part on either side.
+ */
+static void anon_remove(uintptr_t addr, size_t len)
+{
+    uintptr_t end = addr + len;
+    end = end < addr ? UINTPTR_MAX : (end + 16383 < end ? UINTPTR_MAX : (end + 16383) & ~(uintptr_t)16383);
+    addr &= ~(uintptr_t)16383;
+    pthread_mutex_lock(&g_anon_lock);
+    for (int i = 0; i < g_nanon; i++) {
+        uintptr_t a = g_anon[i].addr, e = a + g_anon[i].len;
+        if (addr >= e || end <= a) continue;
+        if (a < addr && e > end) {                           /* cut out of the middle: two pieces remain */
+            g_anon[i].len = addr - a;
+            if (anon_room()) { g_anon[g_nanon].addr = end; g_anon[g_nanon].len = e - end; g_nanon++; }
+        } else if (a < addr) {
+            g_anon[i].len = addr - a;
+        } else if (e > end) {
+            g_anon[i].addr = end; g_anon[i].len = e - end;
+        } else {
+            g_anon[i] = g_anon[--g_nanon]; i--;
+        }
+    }
     pthread_mutex_unlock(&g_anon_lock);
 }
 
@@ -490,9 +530,13 @@ static void *b_mmap(void *addr, size_t len, int prot, int flags, int fd, long of
     if (refuse) { tl_log_line("mm: refusing %#zx bytes (TL_MM_MAX_GIB)", len); errno = ENOMEM; }
     void *r = refuse || (force_phantom && len == 2 * PHANTOM_HALF && prot == 0 && (flags & 0x20) && !(flags & 0x10)) ? MAP_FAILED
             : mmap(addr, len, prot_filter(prot, "mmap"), df, (flags & 0x20) ? -1 : fd, off);
-    if (r == MAP_FAILED && (errno == ENOMEM || force_phantom) && prot == 0 && (flags & 0x20) && !(flags & 0x10)) { r = phantom_reserve(len); if (r != MAP_FAILED) errno = 0; }
+    size_t mapped = len;
+    if (r == MAP_FAILED && (errno == ENOMEM || force_phantom) && prot == 0 && (flags & 0x20) && !(flags & 0x10)) { r = phantom_reserve(len); if (r != MAP_FAILED) { errno = 0; mapped = PHANTOM_HALF; } }
     TL_ERRNO_END();
-    if (r != MAP_FAILED && (flags & 0x20)) anon_add(r, len);
+    /* Only what is really mapped is recorded (of a phantom range, the real half: the other half is not ours to zap). A
+     * file mapping placed over anonymous memory takes that range out of the table. */
+    if (r != MAP_FAILED && (flags & 0x20)) anon_add(r, mapped);
+    else if (r != MAP_FAILED) anon_remove((uintptr_t)r, len);
     mm_trace("mmap", r, len, prot, flags);
     if (r == MAP_FAILED) tl_log_line("mm: mmap FAILED len=%#zx prot=%d flags=%#x errno=%d", len, prot, flags, errno);
     return r;
@@ -501,7 +545,9 @@ static int b_munmap(void *a, size_t l)
 {
     size_t real = phantom_clamp((uintptr_t)a, l);
     if (real == 0) return 0;                                 /* the half of a phantom range that was never mapped */
-    TL_ERRNO_BEGIN(); int r = munmap(a, real); TL_ERRNO_END(); mm_trace("munmap", a, real, r, errno); return r;
+    TL_ERRNO_BEGIN(); int r = munmap(a, real); TL_ERRNO_END(); mm_trace("munmap", a, real, r, errno);
+    if (r == 0) anon_remove((uintptr_t)a, real);
+    return r;
 }
 static int b_mprotect(void *a, size_t l, int prot) { TL_ERRNO_BEGIN(); int r = mprotect(a, l, prot_filter(prot, "mprotect")); int e = errno; TL_ERRNO_END(); mm_trace("mprotect", a, l, prot, r ? e : 0); return r; }
 static int b_madvise(void *a, size_t l, int adv)
@@ -518,7 +564,7 @@ static void *b_mremap(void *old, size_t olds, size_t news, int flags, void *newa
     if (n == MAP_FAILED) { tl_set_guest_errno(12); return (void *)-1; }
     anon_add(n, news);
     memcpy(n, old, olds < news ? olds : news);
-    munmap(old, olds);
+    if (munmap(old, olds) == 0) anon_remove((uintptr_t)old, olds);
     return n;
 }
 
