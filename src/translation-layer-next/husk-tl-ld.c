@@ -2,12 +2,14 @@
 #include "husk-tl-ld.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 
 #include "husk-tl-internal.h"
 #include "husk-tl-a64.h"
@@ -82,6 +84,7 @@ struct tl_lib {
     size_t n_ctr;                  /* reads of CTR_EL0 replaced by a constant */
     size_t n_svc_far, n_adr_failed;   /* svc sites with no stub in branch range (answered ENOSYS), adr sites that could not be rewritten */
     size_t n_x18, n_x18_failed;    /* sites rewritten for the reserved register, and sites that could not be */
+    size_t n_tpidr_shared;         /* reads of TPIDR_EL0 with no stub in range, given the shared thread block */
     int state;                     /* 0 mapped, 1 relocating, 2 relocated, 3 initialising, 4 initialised */
     uint32_t n_unresolved;
 };
@@ -95,7 +98,6 @@ static struct {
     int napks;
     int verbosity;
     size_t unresolved;
-    uint8_t *tcb_rx, *tcb_rw;      /* the fake thread block every `mrs tpidr_el0` reads */
     char **argv, **envp;
     bool recursive_init;
 } G = { .lock = PTHREAD_MUTEX_INITIALIZER, .verbosity = 1 };
@@ -646,13 +648,17 @@ static uint8_t *svc_stub(tl_lib *L, const uint8_t *site_rx)
 
 static int64_t g_vx18_off = -1;     /* byte offset of the virtual-x18 slot from the TSD base */
 
-static bool vx18_init(void)
+/*
+ * Where a pthread key's value lives, as a byte offset from the TSD base that TPIDRRO_EL0 holds (low three bits
+ * masked off), so generated code can read and write it with one load or store and no call. Found by storing a
+ * sentinel and looking for it, because Darwin does not promise a key's slot index. -1 when it cannot be found, or
+ * is beyond what a scaled 12-bit load offset reaches.
+ */
+static int64_t tsd_slot_of(pthread_key_t key)
 {
-    if (g_vx18_off >= 0) return true;
 #if defined(__aarch64__)
-    pthread_key_t key;
-    if (pthread_key_create(&key, NULL)) return false;
     const uintptr_t sentinel = (uintptr_t)0x5a5a1234deadbeefull;
+    void *old = pthread_getspecific(key);
     pthread_setspecific(key, (void *)sentinel);
     uintptr_t base;
     __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(base));
@@ -660,13 +666,23 @@ static bool vx18_init(void)
     const volatile uintptr_t *tsd = (const volatile uintptr_t *)base;
     int64_t off = -1;
     for (int i = 0; i < 520; i++) if (tsd[i] == sentinel) { off = (int64_t)i * 8; break; }
-    pthread_setspecific(key, NULL);
-    if (off < 0 || off > 32760) { pthread_key_delete(key); return false; }
+    pthread_setspecific(key, old);
+    return off > 32760 ? -1 : off;
+#else
+    (void)key;
+    return -1;
+#endif
+}
+
+static bool vx18_init(void)
+{
+    if (g_vx18_off >= 0) return true;
+    pthread_key_t key;
+    if (pthread_key_create(&key, NULL)) return false;
+    int64_t off = tsd_slot_of(key);
+    if (off < 0) { pthread_key_delete(key); return false; }
     g_vx18_off = off;
     return true;
-#else
-    return false;
-#endif
 }
 
 /* The value of the calling thread's virtual x18, for a signal handler to save and restore around guest handlers. */
@@ -697,7 +713,8 @@ static inline uint32_t e_stur(unsigned rt, int imm)  { return 0xF8000000u | (((u
 static inline uint32_t e_ldur(unsigned rt, int imm)  { return 0xF8400000u | (((uint32_t)imm & 0x1FFu) << 12) | (31u << 5) | rt; }
 static inline uint32_t e_mrs_tsd(unsigned rt)        { return 0xD53BD060u | rt; }
 static inline uint32_t e_and_tsd(unsigned r)         { return 0x927DF000u | (r << 5) | r; }          /* and r, r, #~7 */
-static inline uint32_t e_ldr_slot(unsigned rt, unsigned rn) { return 0xF9400000u | ((uint32_t)(g_vx18_off / 8) << 10) | (rn << 5) | rt; }
+static inline uint32_t e_ldr_off(unsigned rt, unsigned rn, int64_t off) { return 0xF9400000u | ((uint32_t)(off / 8) << 10) | (rn << 5) | rt; }   /* ldr rt, [rn, #off] */
+static inline uint32_t e_ldr_slot(unsigned rt, unsigned rn) { return e_ldr_off(rt, rn, g_vx18_off); }
 static inline uint32_t e_str_slot(unsigned rt, unsigned rn) { return 0xF9000000u | ((uint32_t)(g_vx18_off / 8) << 10) | (rn << 5) | rt; }
 
 static int e_mov64(uint32_t *out, unsigned rd, uint64_t v)
@@ -823,6 +840,175 @@ static int x18_rewrite(tl_lib *L, uint32_t *site_rw, const uint8_t *pc, ptrdiff_
     return X18_DONE;
 }
 
+/* ------------------------------------------------------------ thread blocks */
+
+/*
+ * bionic's arm64 thread pointer (TPIDR_EL0) points at its thread control block: eight 8-byte slots at TP+0..63,
+ * of which compiled code reads TLS_SLOT_STACK_GUARD (TP+0x28) in every function built with a stack protector, plus
+ * three slots at negative offsets that only bionic itself uses. Darwin keeps its own thread pointer in TPIDRRO_EL0
+ * and gives TPIDR_EL0 no meaning a guest may rely on, so every `mrs Xt, tpidr_el0` is rewritten to produce the
+ * thread pointer of a block this file owns.
+ *
+ * Each thread that runs guest code for long gets its own block (tl_ld_thread_attach; guest threads get theirs
+ * from pthread_create's shim), its address kept as the value of a pthread key. The rewritten site branches to a
+ * stub that reads that key's TSD slot directly -- the same way the virtual x18 is reached -- using nothing but Xt:
+ *
+ *      mrs  Xt, tpidrro_el0        TSD base, with the CPU number in the low bits
+ *      and  Xt, Xt, #~7
+ *      ldr  Xt, [Xt, #slot]        this thread's block, or 0
+ *      cbnz Xt, 1f
+ *      ldr  Xt, =fallback          a thread with no block of its own shares one
+ *   1: b    <site + 4>
+ *
+ * Threads without a block (the main thread, short-lived host callbacks) share the fallback, which is what every
+ * thread shared before. The fallback lives in the executable region's writable view so that a site with no stub
+ * pool in branch range can still be given `adrp Xt, fallback`: blocks are plain data otherwise, mmap'd.
+ *
+ * Every block carries the same stack-protector cookie, drawn at random once per process. It has to be the same
+ * for a function's entry and exit only, which one per thread would also be, but a guest thread can outlive or
+ * predate its block (key destructors run in some order; a callback can start on a thread before attaching), and a
+ * function that sees two blocks must still see one cookie.
+ */
+#define TCB_PRE   4096u            /* before TP: the block's bookkeeping, and bionic's negative slots (all zero) */
+#define TCB_SLOTS 64u              /* TP+0..63: bionic's slots 0..7 */
+
+typedef struct tcb_hdr { struct tcb_hdr *next, *prev; unsigned rounds; bool shared; } tcb_hdr;
+
+static struct {
+    pthread_mutex_t lock;          /* the list of blocks */
+    pthread_once_t once;
+    pthread_key_t key;             /* this thread's TP, or NULL */
+    bool have_key;
+    int64_t slot;                  /* the key's TSD slot offset, for the stubs; -1 if unknown */
+    size_t span;                   /* bytes from a block's start to its end */
+    uint64_t cookie;
+    uint8_t *fallback;             /* TP of the shared block, in the writable view */
+    tcb_hdr *live;                 /* every block, the fallback's included */
+} T = { .lock = PTHREAD_MUTEX_INITIALIZER, .once = PTHREAD_ONCE_INIT, .slot = -1 };
+
+static inline tcb_hdr *tcb_of(uint8_t *tp) { return (tcb_hdr *)(tp - TCB_PRE); }
+
+/* Lay out a new block at `base` and put it on the list. Called with T.lock held. */
+static uint8_t *tcb_setup(uint8_t *base, bool shared)
+{
+    uint8_t *tp = base + TCB_PRE;
+    uint64_t *s = (uint64_t *)tp;
+    s[0] = (uint64_t)(uintptr_t)tp;     /* self: what x86 code expects at slot 0, harmless where the DTV would be */
+    s[1] = 1000; s[2] = 1000;
+    s[5] = T.cookie;                    /* TLS_SLOT_STACK_GUARD */
+    tcb_hdr *h = tcb_of(tp);
+    h->shared = shared;
+    h->prev = NULL;
+    h->next = T.live;
+    if (T.live) T.live->prev = h;
+    T.live = h;
+    return tp;
+}
+
+static void tcb_dtor(void *tp);
+
+static void tcb_init_once(void)
+{
+    arc4random_buf(&T.cookie, sizeof(T.cookie));
+    T.span = TCB_PRE + TCB_SLOTS;
+    T.span = (T.span + 4095u) & ~(size_t)4095u;
+    if (pthread_key_create(&T.key, tcb_dtor)) return;
+    T.have_key = true;
+    T.slot = tsd_slot_of(T.key);
+    if (T.slot < 0) tl_log_line("ld: no thread-specific slot for thread blocks; every thread will share one");
+}
+
+/* The calling thread's TP: its own block, or the shared one. */
+static uint8_t *tcb_current(void)
+{
+    uint8_t *tp = T.have_key ? pthread_getspecific(T.key) : NULL;
+    return tp ? tp : T.fallback;
+}
+
+static void tcb_release(uint8_t *tp)
+{
+    tcb_hdr *h = tcb_of(tp);
+    pthread_mutex_lock(&T.lock);
+    if (h->prev) h->prev->next = h->next; else T.live = h->next;
+    if (h->next) h->next->prev = h->prev;
+    pthread_mutex_unlock(&T.lock);
+    munmap(tp - TCB_PRE, T.span);
+}
+
+/*
+ * The key's destructor, at thread exit. Darwin clears the slot before calling it, after which the thread reads the
+ * shared block. Guest code still runs here -- its own pthread keys' destructors, which bionic calls in the same
+ * rounds -- so the block is put back and kept until the last round, PTHREAD_DESTRUCTOR_ITERATIONS, and only then
+ * released; keys whose destructors run after ours in that last round see the shared block.
+ */
+static void tcb_dtor(void *v)
+{
+    uint8_t *tp = v;
+    if (++tcb_of(tp)->rounds < PTHREAD_DESTRUCTOR_ITERATIONS && !pthread_setspecific(T.key, tp)) return;
+    tcb_release(tp);
+}
+
+bool tl_ld_thread_attach(void)
+{
+    pthread_once(&T.once, tcb_init_once);
+    if (!T.have_key) return false;
+    if (pthread_getspecific(T.key)) return true;
+    uint8_t *base = mmap(NULL, T.span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (base == MAP_FAILED) return false;
+    pthread_mutex_lock(&T.lock);
+    uint8_t *tp = tcb_setup(base, false);
+    pthread_mutex_unlock(&T.lock);
+    if (pthread_setspecific(T.key, tp)) { tcb_release(tp); return false; }
+    return true;
+}
+
+void tl_ld_thread_detach(void)
+{
+    if (!T.have_key) return;
+    uint8_t *tp = pthread_getspecific(T.key);
+    if (!tp) return;
+    pthread_setspecific(T.key, NULL);
+    tcb_release(tp);
+}
+
+/* The shared block, in the executable region so that `adrp` reaches it from code; and the per-process state. */
+static bool ensure_tcb(void)
+{
+    pthread_once(&T.once, tcb_init_once);
+    if (T.fallback) return true;
+    size_t n = (T.span + PAGE - 1) / PAGE * PAGE;
+    uint8_t *rx, *rw;
+    if (!tl_xmem_alloc(n, &rx, &rw)) return false;
+    memset(rw, 0, n);
+    pthread_mutex_lock(&T.lock);
+    T.fallback = tcb_setup(rw, true);
+    pthread_mutex_unlock(&T.lock);
+    return true;
+}
+
+/*
+ * The stub a `mrs Xt, tpidr_el0` at site_rx branches to (see above): 32 bytes, the last 8 the fallback's address.
+ * False when no TSD slot is known or no stub pool is in range; the caller then points Xt at the shared block.
+ */
+static bool tpidr_stub(tl_lib *L, const uint8_t *site_rx, unsigned rt, uint32_t *branch)
+{
+    uint8_t *rx, *rw; const uint8_t *lit;
+    if (T.slot < 0 || !stub_slot(L, site_rx, &rx, &rw, &lit)) return false;
+    uint32_t code[6] = {
+        e_mrs_tsd(rt),                  /* mrs  Xt, tpidrro_el0 */
+        e_and_tsd(rt),                  /* and  Xt, Xt, #~7 */
+        e_ldr_off(rt, rt, T.slot),      /* ldr  Xt, [Xt, #slot] */
+        0xB5000040u | rt,               /* cbnz Xt, +8  (to the branch back) */
+        0x58000040u | rt,               /* ldr  Xt, +8  (the literal) */
+        e_b(rx + 20, site_rx + 4),      /* b    site+4 */
+    };
+    uint64_t fb = (uint64_t)(uintptr_t)T.fallback;
+    memcpy(rw, code, sizeof(code));
+    memcpy(rw + 24, &fb, 8);
+    *branch = e_b(site_rx, rx);
+    return true;
+}
+
 /* --------------------------------------------------------------- patching */
 
 #if defined(__aarch64__)
@@ -835,13 +1021,11 @@ static uint32_t encode_adrp(uint32_t rt, const void *pc, const void *target)
 }
 
 /*
- * Two rewrites in executable pages, both on the writable view:
+ * Rewrites in executable pages, all on the writable view; among them:
  *
- *  - `mrs Xt, tpidr_el0` becomes `adrp Xt, <fake thread block>`. Android code
- *    reads its stack-protector cookie from [tpidr_el0 + 0x28]; Darwin keeps its
- *    own thread pointer elsewhere and leaves this register for nothing in
- *    particular. Every thread sharing one cookie is harmless: the cookie only has
- *    to be the same at a function's entry and exit.
+ *  - `mrs Xt, tpidr_el0` becomes a branch to a stub that produces the calling
+ *    thread's block (see "thread blocks"); where no stub is in branch range, an
+ *    `adrp Xt` of the block threads without their own share.
  *  - an `adrp` that points into this image's writable pages is retargeted at the
  *    writable view, because code reaches its globals pc-relatively and the page
  *    the executable view shows is not writable.
@@ -860,6 +1044,16 @@ static void patch_image(tl_lib *L, size_t *n_tpidr, size_t *n_adrp, size_t *n_ad
         for (size_t i = 0; i < nwords; i++) {
             uint32_t insn = w[i];
             const uint8_t *pc = x + i * 4;
+            if ((insn & 0xFFFFFFE0u) == 0xD53BD040u) {                  /* mrs Xt, tpidr_el0 */
+                unsigned rt = insn & 0x1Fu;
+                uint32_t branch;
+                if (rt == 31) w[i] = 0xD503201Fu;                       /* into xzr: nothing to produce */
+                else if (rt == 18) { L->n_x18_failed++; continue; }     /* Android's compilers never allocate x18 */
+                else if (tpidr_stub(L, pc, rt, &branch)) w[i] = branch;
+                else { w[i] = encode_adrp(rt, pc, T.fallback); L->n_tpidr_shared++; }
+                (*n_tpidr)++;
+                continue;
+            }
             int xr = x18_rewrite(L, &w[i], pc, delta);
             if (xr == X18_DONE) { L->n_x18++; continue; }
             if (xr == X18_FAILED) { L->n_x18_failed++; continue; }
@@ -869,9 +1063,6 @@ static void patch_image(tl_lib *L, size_t *n_tpidr, size_t *n_adrp, size_t *n_ad
                 uint32_t branch;
                 if (adr_stub(L, pc, insn & 0x1Fu, 0x8444c004ull, &branch)) { w[i] = branch; L->n_ctr++; }
                 else L->n_adr_failed++;
-            } else if ((insn & 0xFFFFFFE0u) == 0xD53BD040u) {            /* mrs Xt, tpidr_el0 */
-                w[i] = encode_adrp(insn & 0x1Fu, pc, G.tcb_rw);
-                (*n_tpidr)++;
             } else if ((insn & 0x9F000000u) == 0x90000000u) {     /* adrp */
                 int64_t imm = (int64_t)((((insn >> 5) & 0x7FFFFu) << 2) | ((insn >> 29) & 3u));
                 if (imm & 0x100000) imm -= 0x200000;
@@ -1129,17 +1320,6 @@ static void parse_dynamic(tl_lib *L, uint64_t dyn_vaddr, uint64_t dyn_size)
     }
 }
 
-static bool ensure_tcb(void)
-{
-    if (G.tcb_rw) return true;
-    if (!tl_xmem_alloc(PAGE, &G.tcb_rx, &G.tcb_rw)) return false;
-    uint64_t *t = (uint64_t *)G.tcb_rw;
-    t[0] = (uint64_t)(uintptr_t)G.tcb_rw;      /* self */
-    t[1] = 1000; t[2] = 1000;
-    t[5] = 0xdeadbeefcafebabeull;             /* [tpidr_el0 + 0x28]: the stack cookie */
-    return true;
-}
-
 static tl_lib *map_library(const char *name, uint8_t *file, size_t flen)
 {
     if (G.nlibs >= MAX_LIBS) { tl_log_line("ld: too many libraries"); return NULL; }
@@ -1205,13 +1385,15 @@ static tl_lib *map_library(const char *name, uint8_t *file, size_t flen)
     }
 
     /* Stub pages after the image: one literal slot, a few probes, a stub for every raw
-     * system call, and one for every instruction that names the reserved register x18. */
+     * system call and read of the thread pointer, and one for every instruction that
+     * names the reserved register x18. */
     size_t stub_bytes = 16 + 8192;
     for (int r = 0; r < ncode; r++) {
         const uint32_t *wv = (const uint32_t *)(file + code[r].foff);
         for (size_t k = 0, cnt = (size_t)(code[r].size / 4); k < cnt; k++) {
             uint32_t v = wv[k];
             if (v == 0xD4000001u) stub_bytes += 32;
+            else if ((v & 0xFFFFFFE0u) == 0xD53BD040u) stub_bytes += 32;                 /* mrs Xt, TPIDR_EL0 */
             else if ((v & 0xFFFFFFE0u) == 0xD53B0020u) stub_bytes += 32;                 /* mrs Xt, CTR_EL0 */
             else if ((v & 0x9F000000u) == 0x10000000u) {                 /* adr: a stub if it reaches writable data */
                 int64_t imm = (int64_t)((((v >> 5) & 0x7FFFFu) << 2) | ((v >> 29) & 3u));
@@ -1306,6 +1488,7 @@ static bool relocate(tl_lib *L)
         if (ad) tl_log_line("ld:   %s: %zu 'adr' instructions that reach writable data rewritten", L->name, ad);
         if (L->n_adr_failed) tl_log_line("ld:   %s: %zu 'adr' instructions reach writable data and could not be rewritten", L->name, L->n_adr_failed);
         if (L->n_ctr) tl_log_line("ld:   %s: %zu reads of CTR_EL0 replaced by a constant", L->name, L->n_ctr);
+        if (L->n_tpidr_shared) tl_log_line("ld:   %s: %zu reads of TPIDR_EL0 have no stub in range and see the shared thread block", L->name, L->n_tpidr_shared);
         if (L->n_svc_far) tl_log_line("ld:   %s: %zu raw system-call sites are out of branch range of the stubs and answer ENOSYS", L->name, L->n_svc_far);
         if (sv) tl_log_line("ld:   %s: %zu raw system-call sites rewritten", L->name, sv);
         if (L->n_x18 || L->n_x18_failed) tl_log_line("ld:   %s: %zu instructions using x18 rewritten for the virtual register%s", L->name, L->n_x18,

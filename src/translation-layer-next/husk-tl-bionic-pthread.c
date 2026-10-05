@@ -379,6 +379,9 @@ static void *start_thunk(void *p)
 {
     start_ctx c = *(start_ctx *)p;
     free(p);
+    /* The guest's thread pointer: its own bionic slots, and (with ELF TLS) its own thread-locals. Released by the
+     * linker's key destructor however the thread ends, pthread_exit included. */
+    if (!tl_ld_thread_attach()) tl_log_line("thread: no thread block of its own; sharing the common one");
     if (g_thread_trace < 0) g_thread_trace = getenv("TL_THREAD_TRACE") ? 1 : 0;
     if (g_thread_trace) {
         const char *ln = NULL; const void *sa = NULL;

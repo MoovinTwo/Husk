@@ -20,6 +20,14 @@
  * pages (see husk-tl-xmem.h), so an address handed out for a data object is its
  * writable view and one for code is its executable view; the loader rewrites
  * code that would otherwise reach data through the wrong one.
+ *
+ * The thread pointer. Android code reads bionic's thread block through TPIDR_EL0
+ * (the stack-protector cookie at +0x28 in every protected function), a register
+ * Darwin gives no such meaning. Each `mrs Xt, tpidr_el0` becomes a branch to a
+ * stub that loads the calling thread's block from a pthread key's TSD slot, read
+ * through TPIDRRO_EL0 as the virtual x18 is, and falls back to one block shared by
+ * threads that have none. Blocks hold bionic's eight slots at TP+0..63 with one
+ * random cookie per process; see tl_ld_thread_attach.
  */
 #ifndef HUSK_TL_LD_H
 #define HUSK_TL_LD_H
@@ -88,6 +96,16 @@ bool tl_ld_probe(tl_lib *lib, uint64_t vaddr, void (*cb)(uint64_t *regs));
  */
 uint64_t tl_vx18_get(void);
 void tl_vx18_set(uint64_t v);
+
+/*
+ * Give the calling thread its own thread block -- what guest code finds through
+ * TPIDR_EL0: bionic's slots, the stack-protector cookie -- in place of the one
+ * threads without their own share. Guest threads get one from pthread_create;
+ * a host thread that runs guest code for long should call this first. The block
+ * is released when the thread exits, or by detach. Attaching twice is harmless.
+ */
+bool tl_ld_thread_attach(void);
+void tl_ld_thread_detach(void);
 
 /* Imports that nothing provided, bound to a stub that logs on call. */
 size_t tl_ld_unresolved_count(void);

@@ -19,6 +19,7 @@
  */
 #define _DARWIN_C_SOURCE
 #include "husk-tl-jni.h"
+#include "husk-tl-ld.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -277,6 +278,7 @@ static void *looper_thread(void *arg)
     looper *l = arg;
     t_looper = l;
     pthread_setname_np(l->name);
+    tl_ld_thread_attach();          /* the callbacks it delivers are guest code */
     pthread_mutex_lock(&l->mu);
     while (!l->quit) {
         ev *e = l->head;

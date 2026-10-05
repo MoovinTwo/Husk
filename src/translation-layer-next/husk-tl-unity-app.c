@@ -161,6 +161,7 @@ static void *launch_thread(void *arg)
 {
     (void)arg;
     pthread_setname_np("husk-native-start");
+    tl_ld_thread_attach();          /* the guest's constructors and start-up run here: its own thread block */
     tl_guest_exit_hook = guest_exit;
     {
         char path[1100];

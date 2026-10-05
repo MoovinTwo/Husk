@@ -138,6 +138,7 @@ static void *ui_main(void *arg)
 {
     (void)arg;
     pthread_setname_np("UiThread");
+    tl_ld_thread_attach();          /* guest code runs here for the whole game: its own thread block */
     /* Android's main thread already has a looper; the game asks for it (ALooper_forThread) while it initialises. */
     UI.looper = ((void *(*)(int))tl_bionic_find("ALooper_prepare"))(0);
     void *env = tl_jni_env();

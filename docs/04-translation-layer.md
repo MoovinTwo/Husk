@@ -173,6 +173,29 @@ and whether it survives into a signal handler. If it passes, Android code runs
 as it is. If it fails, every `mrs Xn, tpidr_el0` has to be rewritten at load
 time, and the scanner already counts them per library.
 
+The loader in `src/translation-layer-next` does not wait for that answer: it
+rewrites every `mrs Xt, tpidr_el0` regardless (`husk-tl-ld.c`, "thread
+blocks"). Each site becomes a branch to a 32-byte stub in the library's stub
+pages that uses nothing but `Xt`: it reads Darwin's TSD base from
+`TPIDRRO_EL0`, loads the value of a pthread key from its TSD slot (found once
+by planting a sentinel, as for the virtual x18), and if that is zero loads the
+address of a shared block from a literal, then branches back. So every thread
+that has a block of its own sees it, and the rest share one.
+
+A block is bionic's TCB: slots 0..7 at TP+0..63 (self, 1000, 1000, 0, 0, the
+stack-protector cookie, 0, 0), with a page before TP for bookkeeping and the
+negative slots bionic reserves. The cookie is one random value per process
+(`arc4random_buf`), the same in every block, so a function whose thread
+changes blocks between entry and exit still finds the same cookie. Guest
+threads get a block from the `pthread_create` shim; the drivers' long-lived
+threads (UnityMain, GLThread, UiThread, the start-up thread, Looper threads)
+call `tl_ld_thread_attach`. Blocks are released by the key's destructor,
+which re-arms itself until the last destructor round so that the guest's own
+TSD destructors still see the thread's block. The shared block lives in the
+executable region's writable view so that a site with no stub pool in branch
+range can still be given `adrp Xt, <shared block>`; the others are plain
+`mmap`ed data.
+
 ### x18: measured on the phone
 
 Clang reserves x18 for both Android and iOS targets (checked: it allocates x18

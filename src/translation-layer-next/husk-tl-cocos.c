@@ -239,6 +239,7 @@ static void *gl_main(void *arg)
 {
     (void)arg;
     pthread_setname_np("GLThread");
+    tl_ld_thread_attach();          /* guest code runs here for the whole game: its own thread block */
     tl_log_line("cocos: GL thread started");
     EGLDisplay (*getDisplay)(void *) = tl_egl_resolve("eglGetDisplay");
     unsigned (*initialize)(EGLDisplay, EGLint *, EGLint *) = tl_egl_resolve("eglInitialize");
