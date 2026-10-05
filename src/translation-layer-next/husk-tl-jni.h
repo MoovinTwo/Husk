@@ -46,7 +46,7 @@ struct jobj {
     };
     jvalue *fields;                     /* instance fields, indexed by tl_jfield::index */
     uint32_t nfields;
-    uint64_t refslots;                  /* which of fields[0..63] hold a reference of their own */
+    uint64_t *refslots;                 /* bit i: fields[i] holds a reference of its own; as many words as nfields needs */
     void *native;                       /* an implementation's own state */
     void *monitor;
 };
