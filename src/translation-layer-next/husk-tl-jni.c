@@ -396,9 +396,11 @@ static tl_jfield *lookup_field(tl_jclass *cls, const char *name, const char *sig
         else if (strcmp(c->name, "java/lang/Object")) found = true;
     }
     if (!create && !found) return NULL;
+    pthread_mutex_lock(&g_lock);
+    /* Another thread may have made it while the lock was down; two of one field would each hold their own value. */
+    if ((f = find_field_locked(cls, name, sig, is_static))) { pthread_mutex_unlock(&g_lock); return f; }
     f = calloc(1, sizeof(*f));
     f->cls = owner; f->name = strdup(name); f->sig = strdup(sig); f->is_static = is_static;
-    pthread_mutex_lock(&g_lock);
     if (is_static) {
         f->index = (uint32_t)owner->nstatics++;
         owner->statics = realloc(owner->statics, (size_t)owner->nstatics * sizeof(jvalue));
