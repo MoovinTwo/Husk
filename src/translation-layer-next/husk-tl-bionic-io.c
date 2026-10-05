@@ -412,27 +412,26 @@ static void anon_cut_locked(uintptr_t addr, uintptr_t end)
 }
 
 /* A new mapping replaces only what it covers: one placed inside a bigger region leaves the rest of that region recorded. */
-static void anon_add(void *addr, size_t len)
+static void anon_add_locked(void *addr, size_t len)
 {
-    pthread_mutex_lock(&g_anon_lock);
     anon_cut_locked((uintptr_t)addr, (uintptr_t)addr + len);
     if (anon_room()) { g_anon[g_nanon].addr = (uintptr_t)addr; g_anon[g_nanon].len = len; g_nanon++; }
-    pthread_mutex_unlock(&g_anon_lock);
 }
 
 /*
  * Forget [addr, addr+len) once it is unmapped, or the table fills with ranges that are gone and a later MADV_DONTNEED
  * would map fresh pages over whatever has since taken their place. munmap takes whole pages, so the range is rounded
  * out to them.
+ *
+ * The caller holds g_anon_lock across the unmapping and this, together. Otherwise another thread can map the same
+ * addresses in between, record them, and have its new entry forgotten here.
  */
-static void anon_remove(uintptr_t addr, size_t len)
+static void anon_remove_locked(uintptr_t addr, size_t len)
 {
     uintptr_t end = addr + len;
     end = end < addr ? UINTPTR_MAX : (end + 16383 < end ? UINTPTR_MAX : (end + 16383) & ~(uintptr_t)16383);
     addr &= ~(uintptr_t)16383;
-    pthread_mutex_lock(&g_anon_lock);
     anon_cut_locked(addr, end);
-    pthread_mutex_unlock(&g_anon_lock);
 }
 
 static void anon_zap(uintptr_t addr, size_t len)
@@ -531,6 +530,10 @@ static void *b_mmap(void *addr, size_t len, int prot, int flags, int fd, long of
     static size_t max_map = (size_t)-2;                                              /* TL_MM_MAX_GIB: refuse bigger single mappings, as a phone does */
     if (max_map == (size_t)-2) max_map = getenv("TL_MM_MAX_GIB") ? (size_t)atoi(getenv("TL_MM_MAX_GIB")) << 30 : (size_t)-1;
     bool refuse = len > max_map && (flags & 0x20) && !(flags & 0x10);
+    /* A fixed mapping replaces whatever was there, and a file mapping takes its range out of the table: either way the
+     * table is updated under the same lock as the mapping, as munmap's is. */
+    bool held = (flags & 0x10) || !(flags & 0x20);
+    if (held) pthread_mutex_lock(&g_anon_lock);
     if (refuse) { tl_log_line("mm: refusing %#zx bytes (TL_MM_MAX_GIB)", len); errno = ENOMEM; }
     void *r = refuse || (force_phantom && len == 2 * PHANTOM_HALF && prot == 0 && (flags & 0x20) && !(flags & 0x10)) ? MAP_FAILED
             : mmap(addr, len, prot_filter(prot, "mmap"), df, (flags & 0x20) ? -1 : fd, off);
@@ -539,8 +542,10 @@ static void *b_mmap(void *addr, size_t len, int prot, int flags, int fd, long of
     TL_ERRNO_END();
     /* Only what is really mapped is recorded (of a phantom range, the real half: the other half is not ours to zap). A
      * file mapping placed over anonymous memory takes that range out of the table. */
-    if (r != MAP_FAILED && (flags & 0x20)) anon_add(r, mapped);
-    else if (r != MAP_FAILED) anon_remove((uintptr_t)r, len);
+    if (!held) pthread_mutex_lock(&g_anon_lock);
+    if (r != MAP_FAILED && (flags & 0x20)) anon_add_locked(r, mapped);
+    else if (r != MAP_FAILED) anon_remove_locked((uintptr_t)r, len);
+    pthread_mutex_unlock(&g_anon_lock);
     mm_trace("mmap", r, len, prot, flags);
     if (r == MAP_FAILED) tl_log_line("mm: mmap FAILED len=%#zx prot=%d flags=%#x errno=%d", len, prot, flags, errno);
     return r;
@@ -549,8 +554,11 @@ static int b_munmap(void *a, size_t l)
 {
     size_t real = phantom_clamp((uintptr_t)a, l);
     if (real == 0) return 0;                                 /* the half of a phantom range that was never mapped */
-    TL_ERRNO_BEGIN(); int r = munmap(a, real); TL_ERRNO_END(); mm_trace("munmap", a, real, r, errno);
-    if (r == 0) anon_remove((uintptr_t)a, real);
+    pthread_mutex_lock(&g_anon_lock);
+    TL_ERRNO_BEGIN(); int r = munmap(a, real); TL_ERRNO_END();
+    if (r == 0) anon_remove_locked((uintptr_t)a, real);
+    pthread_mutex_unlock(&g_anon_lock);
+    mm_trace("munmap", a, real, r, errno);
     return r;
 }
 static int b_mprotect(void *a, size_t l, int prot) { TL_ERRNO_BEGIN(); int r = mprotect(a, l, prot_filter(prot, "mprotect")); int e = errno; TL_ERRNO_END(); mm_trace("mprotect", a, l, prot, r ? e : 0); return r; }
@@ -566,9 +574,11 @@ static void *b_mremap(void *old, size_t olds, size_t news, int flags, void *newa
     (void)flags; (void)newaddr;
     void *n = mmap(NULL, news, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
     if (n == MAP_FAILED) { tl_set_guest_errno(12); return (void *)-1; }
-    anon_add(n, news);
     memcpy(n, old, olds < news ? olds : news);
-    if (munmap(old, olds) == 0) anon_remove((uintptr_t)old, olds);
+    pthread_mutex_lock(&g_anon_lock);
+    anon_add_locked(n, news);
+    if (munmap(old, olds) == 0) anon_remove_locked((uintptr_t)old, olds);
+    pthread_mutex_unlock(&g_anon_lock);
     return n;
 }
 
