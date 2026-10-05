@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * Where a thread lands when the game ends under it.
+ * Where a thread lands when the game ends under it, and what a host thread needs before it calls the guest.
  *
  * On Android a game that calls exit() or abort() ends its own process. Here the game shares a process with Husk,
  * so its end has to be confined to its own code: whatever guest frames are on the stack are abandoned, and the
@@ -25,6 +25,17 @@
  * Once the game has ended, a pad cannot be pushed: TL_GUEST_CALL and TL_JNI_NATIVE_CALL skip the call, and driver
  * loops test tl_guest_ended() to stop. A result the skipped call would have assigned keeps the value it had, so
  * callers initialise the variables such calls assign.
+ */
+/*
+ * The first pad pushed on a thread also gives the thread a thread block of its own (tl_ld_thread_attach), once,
+ * behind a thread-local flag: guest code reached from a host thread -- the main thread delivering a Unity touch, the
+ * AAudio pump, a Looper thread -- otherwise runs on the block threads without one share, and so shares its
+ * stack-protector slots and every thread_local with every other such thread. Threads the runtime starts for guest
+ * code attach when they start anyway. Nothing detaches them: the block goes with the thread (the linker's key
+ * destructor), and threads the system owns, the main thread and the dispatch queues' threads, outlive the game. The
+ * host's callback threads that do not call guest code need nothing: AudioQueue's (husk-tl-audio.c copies samples out
+ * of a ring the guest's mixer filled on its own thread), and NSURLSession's completion queue (husk-tl-http.m signals
+ * the guest's thread, which is waiting in UnityWebRequest.run, and the guest's callbacks run there).
  */
 #ifndef HUSK_TL_GUEST_H
 #define HUSK_TL_GUEST_H

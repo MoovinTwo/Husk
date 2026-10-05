@@ -257,6 +257,7 @@ void (*tl_guest_exit_hook)(int status);
 static atomic_bool g_guest_ended;
 static __thread tl_guest_pad *t_pad;           /* the innermost pad of this thread */
 static __thread bool t_guest_thread;           /* started by the guest: its pads are never landed on */
+static __thread bool t_attached;               /* this thread has been given its own thread block */
 
 bool tl_guest_ended(void) { return atomic_load_explicit(&g_guest_ended, memory_order_acquire); }
 void tl_guest_thread_mark(void) { t_guest_thread = true; }
@@ -265,6 +266,9 @@ bool tl_guest_thread_marked(void) { return t_guest_thread; }
 bool tl_guest_pad_push(tl_guest_pad *p)
 {
     if (tl_guest_ended()) return false;
+    /* The first call into the guest on a thread gives the thread a block of its own (see husk-tl-guest.h). A thread
+     * that cannot have one keeps sharing the common block; it is not asked again. */
+    if (!t_attached) { t_attached = true; (void)tl_ld_thread_attach(); }
     p->prev = t_pad;
     p->jni_depth = tl_jni_local_depth();
     p->landed = 0;
