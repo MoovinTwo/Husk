@@ -36,12 +36,17 @@ if ! command -v aarch64-linux-gnu-gcc >/dev/null || ! command -v qemu-aarch64 >/
     exit 0
 fi
 # The checks do not touch ZIP files, so the scanner's zlib is stubbed out
-# rather than cross-built.
+# rather than cross-built; nor is there a debugger-granted JIT region here
+# (the loader that finds one is Darwin-only), so the dual-mapping check skips.
 cat > "$OUT/noscan.c" <<'EOF'
+#include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 char *husk_tl_scan(const char *const *p, int n) { (void)p; (void)n; return NULL; }
 void *husk_tl_read_entry(const char *a, const char *b, size_t l, size_t *o)
 { (void)a; (void)b; (void)l; *o = 0; return NULL; }
+void *tl_find_stikdebug_prewarmed(void) { return NULL; }
+bool tl_jit_carve(size_t n, uint8_t **rx, uint8_t **rw) { (void)n; (void)rx; (void)rw; return false; }
 EOF
 aarch64-linux-gnu-gcc $CFLAGS -static -o "$OUT/checks_arm64" "$HERE/scan_cli.c" \
     "$OUT/noscan.c" "$SRC"/husk-tl-json.c "$SRC"/husk-tl-probe.c \
