@@ -1,3 +1,14 @@
+// husk-jit.js -- the JIT script Husk hands its debugger (StikDebug or Built-in StikJIT).
+//
+// This file is not Husk's own code and is not covered by Husk's GPL-2.0-or-later
+// licence. It is StikDebug's universal JIT script (StikDebug/Scripts/universal.js,
+// https://github.com/StikDebug/StikDebug), an earlier revision taken from the base64
+// copy MeloNX embeds, unmodified apart from this notice. StikDebug is licensed under
+// the GNU Affero General Public License version 3; the full text ships in the app as
+// legal/LICENSE-StikDebug-AGPL-3.0.txt. This file is its own complete source.
+//
+// SPDX-License-Identifier: AGPL-3.0-only
+
 const CMD_DETACH = 0;
 const CMD_PREPARE_REGION = 1;
 const CMD_NEW_BREAKPOINTS = 2;
