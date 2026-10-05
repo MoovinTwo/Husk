@@ -21,11 +21,27 @@ enum JITMethod: String, CaseIterable, Identifiable {
         case .builtIn: return "Built-in StikJIT"
         }
     }
+
+    /// Whether this method can work on this device right now. TrollStore only answers
+    /// its `apple-magnifier` scheme when it is installed, and it does not install on
+    /// the iOS versions Husk targets, so offering it there only leads to a dead end.
+    @MainActor var isAvailable: Bool {
+        switch self {
+        case .trollStore: return JITBootstrap.isTrollStoreInstalled
+        case .automatic, .stikDebug, .builtIn: return true
+        }
+    }
+
+    /// The methods Settings offers: the unavailable ones are left out rather than shown
+    /// and refused, except the current choice, which a Picker needs a row for.
+    @MainActor static func offered(keeping current: JITMethod) -> [JITMethod] {
+        allCases.filter { $0.isAvailable || $0 == current }
+    }
 }
 
 /// Where Built-in StikJIT's pairing file came from.
 enum JITPairingSource: String {
-    /// Made by Husk on this device (iOS 27, OnDevicePairing).
+    /// Made by Husk on this device (iOS 27 and later, OnDevicePairing).
     case onDevice
     /// Imported from a file made on a computer.
     case imported
@@ -231,12 +247,24 @@ final class JITCoordinator: ObservableObject {
     private init() {
         method = UserDefaults.standard.string(forKey: "husk.jitMethod")
             .flatMap(JITMethod.init(rawValue:)) ?? .automatic
+        validateMethod()
     }
 
+    /// A choice saved when its method still worked (TrollStore since removed, or a
+    /// setting carried over from another device) falls back to Automatic rather than
+    /// failing at every launch.
+    func validateMethod() {
+        guard !method.isAvailable else { return }
+        log("stored JIT method \(method.title) is not available on this device; using Automatic")
+        method = .automatic
+    }
+
+    /// The concrete method to use. Automatic picks the first one that can work here,
+    /// and a choice that has stopped working is treated as Automatic too.
     var resolvedMethod: JITMethod {
-        guard method == .automatic else { return method }
+        guard method == .automatic || !method.isAvailable else { return method }
         if JITBootstrap.isStikDebugInstalled { return .stikDebug }
-        if JITBootstrap.isTrollStoreInstalled { return .trollStore }
+        if JITMethod.trollStore.isAvailable { return .trollStore }
         return .builtIn
     }
 

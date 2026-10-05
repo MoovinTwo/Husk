@@ -185,6 +185,17 @@ struct OnboardingView: View {
         }
     }
 
+    /// The JIT page's explanation. Pairing on the device itself only exists from
+    /// iOS 27, so earlier versions are told about the pairing file instead.
+    private var jitIntro: String {
+        "Android needs JIT, which on iOS only an attached debugger can grant. "
+            + (OnDevicePairing.isSupported
+               ? "Husk can be that debugger itself: it pairs with this iPhone from Settings, "
+                 + "no computer needed. StikDebug works too."
+               : "Husk can be that debugger itself, using a pairing file made once on a computer "
+                 + "and LocalDevVPN. StikDebug works too.")
+    }
+
     private var jitPage: some View {
         VStack(spacing: 18) {
             Spacer()
@@ -192,9 +203,7 @@ struct OnboardingView: View {
                 .font(.system(size: 54))
                 .foregroundStyle(Theme.accent)
             Text("Turn on JIT").font(.largeTitle.weight(.semibold))
-            Text("Android needs JIT, which on iOS only an attached debugger can grant. "
-               + "Husk can be that debugger itself: on iOS 27 it pairs with this iPhone "
-               + "from Settings, no computer needed. StikDebug works too.")
+            Text(jitIntro)
                 .font(.callout).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 34)

@@ -4,10 +4,11 @@ import UniformTypeIdentifiers
 
 /// The JIT walkthrough: pick a way in, follow its numbered steps, end with JIT on.
 ///
-/// Three ways in. Pairing on this iPhone (iOS 27) and a pairing file made on a
-/// computer both lead to Built-in StikJIT and share the last two steps,
-/// LocalDevVPN and enabling. StikDebug has its own short page. Presented from
-/// onboarding, Settings › JIT, and whenever Start finds JIT not set up.
+/// Up to four ways in. Pairing on this iPhone (iOS 27 and later only) and a pairing
+/// file made on a computer both lead to Built-in StikJIT and share the last two steps,
+/// LocalDevVPN and enabling. StikDebug has its own short page, and so does TrollStore
+/// when it is installed. Presented from onboarding, Settings › JIT, and whenever Start
+/// finds JIT not set up.
 struct JITSetupFlow: View {
     enum Step: Hashable { case pairOnDevice, importFile, connect, enable, stikDebug, trollStore }
 
@@ -43,6 +44,7 @@ struct JITSetupFlow: View {
         }
         .onAppear {
             jit.refreshPairingStatus()
+            jit.validateMethod()
             pairing.reset()
             // A failed enable from the Library lands on the step that can fix it.
             if jit.error != nil, jit.hasPairing, jit.resolvedMethod == .builtIn {
@@ -68,12 +70,15 @@ struct JITSetupFlow: View {
                      + "debugger can grant. Choose how your \(device) gets one.") {
             VStack(spacing: 10) {
                 let builtIn = HuskBuiltInJIT.unavailableReason
-                way("Pair on this \(device)", symbol: "iphone.radiowaves.left.and.right",
-                    detail: builtIn ?? (!OnDevicePairing.isSupported ? "Needs iOS 27 or later."
-                        : jit.pairingSource == .onDevice ? "Paired on this \(device)."
-                        : "No computer needed. Pairs from Settings in a minute."),
-                    done: jit.pairingSource == .onDevice,
-                    enabled: builtIn == nil && OnDevicePairing.isSupported) { path.append(.pairOnDevice) }
+                // Pairing on the device needs iOS 27; before that the route is left out
+                // rather than shown greyed out, so a pairing file is the obvious way in.
+                if OnDevicePairing.isSupported {
+                    way("Pair on this \(device)", symbol: "iphone.radiowaves.left.and.right",
+                        detail: builtIn ?? (jit.pairingSource == .onDevice ? "Paired on this \(device)."
+                            : "No computer needed. Pairs from Settings in a minute."),
+                        done: jit.pairingSource == .onDevice,
+                        enabled: builtIn == nil) { path.append(.pairOnDevice) }
+                }
                 way("Use a pairing file", symbol: "doc.badge.plus",
                     detail: builtIn ?? (jit.pairingSource == .imported ? "Pairing file imported."
                         : "Import a pairing file made on a computer."),
@@ -83,10 +88,13 @@ struct JITSetupFlow: View {
                     detail: JITBootstrap.isStikDebugInstalled ? "StikDebug is installed."
                         : "Enable JIT through the StikDebug app.",
                     done: jit.method == .stikDebug) { path.append(.stikDebug) }
-                way("Use TrollStore", symbol: "sparkles",
-                    detail: JITBootstrap.isTrollStoreInstalled ? "TrollStore is installed."
-                        : "For a Husk installed through TrollStore.",
-                    done: jit.method == .trollStore) { path.append(.trollStore) }
+                // TrollStore is only offered where it answers its URL scheme. It does not
+                // install on current iOS versions, so elsewhere the row would be a dead end.
+                if JITMethod.trollStore.isAvailable {
+                    way("Use TrollStore", symbol: "sparkles",
+                        detail: "TrollStore is installed.",
+                        done: jit.method == .trollStore) { path.append(.trollStore) }
+                }
             }
             if jit.hasPairing && HuskBuiltInJIT.isAvailable {
                 Button { path.append(.connect) } label: {
