@@ -428,9 +428,10 @@ static void anon_add_locked(void *addr, size_t len)
  */
 static void anon_remove_locked(uintptr_t addr, size_t len)
 {
+    uintptr_t m = (uintptr_t)vm_page_size - 1;          /* the host's page: 16 KiB on a phone, 4 KiB on an Intel Mac */
     uintptr_t end = addr + len;
-    end = end < addr ? UINTPTR_MAX : (end + 16383 < end ? UINTPTR_MAX : (end + 16383) & ~(uintptr_t)16383);
-    addr &= ~(uintptr_t)16383;
+    end = end < addr ? UINTPTR_MAX : (end + m < end ? UINTPTR_MAX : (end + m) & ~m);
+    addr &= ~m;
     anon_cut_locked(addr, end);
 }
 
@@ -442,7 +443,7 @@ static void anon_zap(uintptr_t addr, size_t len)
         uintptr_t a = g_anon[i].addr > addr ? g_anon[i].addr : addr;
         uintptr_t e = g_anon[i].addr + g_anon[i].len < end ? g_anon[i].addr + g_anon[i].len : end;
         if (a >= e) continue;
-        for (uintptr_t p = a & ~(uintptr_t)16383; p < e;) {           /* walk the regions in the range */
+        for (uintptr_t p = a & ~((uintptr_t)vm_page_size - 1); p < e;) {           /* walk the regions in the range */
             vm_address_t ra = p; vm_size_t rs = 0;
             vm_region_basic_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj;
             if (vm_region_64(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &cnt, &obj) != KERN_SUCCESS) break;
