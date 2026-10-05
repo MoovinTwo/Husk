@@ -594,8 +594,9 @@ final class GuestBridge {
     ///
     /// Deliberately does NOT probe 5555.
     ///
-    /// adbd binds that port and it is forwarded, which makes it an inviting
-    /// control for "is the guest's network up at all". Husk does not use adb --
+    /// adbd binds that port in the guest (it is no longer forwarded to the
+    /// host), which makes it an inviting control for "is the guest's network up
+    /// at all". Husk does not use adb --
     /// LineageOS keeps adbd in adbd_tradeinmode until setup completes and
     /// refuses every shell in that domain, which is the whole reason husk_agent
     /// exists. Even a connect-only probe would imply a dependency this project
