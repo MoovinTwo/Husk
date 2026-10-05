@@ -958,7 +958,9 @@ final class QemuRunner: ObservableObject {
     // cannot be walked back. Another app reaching a larger number does not
     // transfer -- clean file-backed pages are evictable and charged
     // differently.
-    static let jitMiB = 256          // tb-size
+    // The region the app claims, not tb-size: prewarm takes
+    // JITBootstrap.jitBytes and QEMU is handed that whole region.
+    static let jitRegionMiB = JITBootstrap.jitBytes / (1024 * 1024)
     static let qemuOverheadMiB = 750 // measured, not guessed
     // Real margin, in megabytes rather than a fraction. A fraction of what
     // was left quietly cost ~375 MiB the guest could have had; the run that
@@ -980,7 +982,14 @@ final class QemuRunner: ObservableObject {
         // claims it before this runs, so os_proc_available_memory() has already
         // fallen by that much -- subtracting again charged for it twice and cut
         // the guest from 1906 MiB to 1650.
-        let jitStillToCome = JITBootstrap.prewarmed ? 0 : jitMiB
+        //
+        // Not yet taken, it is charged at the size prewarm will claim, not at
+        // tb-size. The update check asks this before prewarm, and charging the
+        // 256 MiB tb-size there overstated headroom by 256 MiB -- enough to
+        // download a snapshot the launch-time check then refused. If prewarm
+        // fails outright, QEMU maps its own tb-size buffer instead and this
+        // over-charges by the difference; erring that way only costs headroom.
+        let jitStillToCome = JITBootstrap.prewarmed ? 0 : jitRegionMiB
         return (availableMiB,
                 availableMiB - safetyMarginMiB - jitStillToCome - qemuOverheadMiB)
     }
@@ -1027,7 +1036,7 @@ final class QemuRunner: ObservableObject {
         }
 
         let physMiB = Int(ProcessInfo.processInfo.physicalMemory / (1024 * 1024))
-        let jitMiB = QemuRunner.jitMiB
+        let jitMiB = QemuRunner.jitRegionMiB
         let qemuOverheadMiB = QemuRunner.qemuOverheadMiB
         let safetyMarginMiB = QemuRunner.safetyMarginMiB
 
@@ -1085,9 +1094,12 @@ final class QemuRunner: ObservableObject {
 
         QemuRunner.shared.lastGuestMiB = target
         try? String(target).write(toFile: ramAttemptPath, atomically: true, encoding: .utf8)
+        // Hoisted: one more ternary in the concatenation below is the kind of
+        // thing that tips the type checker into "too complex".
+        let jitHeld = JITBootstrap.prewarmed ? " (already claimed)" : ""
         HuskLog.log("qemu", "memory budget: \(physMiB) MiB physical but "
                           + "\(availableMiB) MiB before jetsam -- that is the real "
-                          + "ceiling; reserving \(jitMiB) MiB JIT + \(qemuOverheadMiB) "
+                          + "ceiling; reserving \(jitMiB) MiB JIT\(jitHeld) + \(qemuOverheadMiB) "
                           + "MiB overhead + \(safetyMarginMiB) MiB margin; "
                           + "GUEST GETS \(target) MiB "
                           + (fileBackedTarget != nil
