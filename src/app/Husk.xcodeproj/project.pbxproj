@@ -30,6 +30,7 @@
 		2472A0B862A3BC5106DBAEBC /* husk-tl-load.c in Sources */ = {isa = PBXBuildFile; fileRef = 5BE31DC5ACA28C0133F828FA /* husk-tl-load.c */; };
 		29B4497EDC1E890D82BDF969 /* GuestManifest.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A0490485F9BA884A0554EAD /* GuestManifest.swift */; };
 		2A70738EC7BE5ABEA7509E8B /* husk-tl-blit.c in Sources */ = {isa = PBXBuildFile; fileRef = CB3F6E9B90C81C37AAABE363 /* husk-tl-blit.c */; };
+		2CD4AAC16258C1815CFBFCDB /* husk-tl-anon.c in Sources */ = {isa = PBXBuildFile; fileRef = D620F10A0861C01571856AD0 /* husk-tl-anon.c */; };
 		308AC941024A28652B15B3F4 /* husk-tl-res.c in Sources */ = {isa = PBXBuildFile; fileRef = 7FD8DC66414547110F0E0B0E /* husk-tl-res.c */; };
 		340ADF13F9F0E48A5A443600 /* HuskBridgeFS.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0168E1B352FFD7A4BC207CA5 /* HuskBridgeFS.swift */; };
 		3519D130E3ACECEB2A25D174 /* husk-tl-bionic-net.c in Sources */ = {isa = PBXBuildFile; fileRef = 7F8AFBCC1E9A402444C2D1E6 /* husk-tl-bionic-net.c */; };
@@ -213,6 +214,7 @@
 		6D7C478354C0F283365422FD /* husk-tl-dex.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "husk-tl-dex.h"; sourceTree = "<group>"; };
 		6F40192B3EDAD27D2CBFFC2F /* BootScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BootScreen.swift; sourceTree = "<group>"; };
 		7104A621330A81BD69495520 /* husk-tl-internal.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "husk-tl-internal.h"; sourceTree = "<group>"; };
+		72C2D1EF041B9252706EC3B6 /* husk-tl-anon.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "husk-tl-anon.h"; sourceTree = "<group>"; };
 		766F6F7816E672E83CFFE47D /* PipeShim.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = PipeShim.c; sourceTree = "<group>"; };
 		771B4FD56CABC214FEED6DFE /* GuestImage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GuestImage.swift; sourceTree = "<group>"; };
 		79E4865C5FE44ADD210A4917 /* OnboardingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingView.swift; sourceTree = "<group>"; };
@@ -253,6 +255,7 @@
 		D08FCD7F480D6E2F65F26636 /* husk-tl-elf.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "husk-tl-elf.c"; sourceTree = "<group>"; };
 		D0A9148DED6969D97D56406C /* LICENSES-rppairing-crates.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "LICENSES-rppairing-crates.txt"; sourceTree = "<group>"; };
 		D50A30F186B58956276C9B24 /* husk-tl-framework.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "husk-tl-framework.c"; sourceTree = "<group>"; };
+		D620F10A0861C01571856AD0 /* husk-tl-anon.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "husk-tl-anon.c"; sourceTree = "<group>"; };
 		D91C1E7D6301EBCE06FEE0FE /* HuskMetalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HuskMetalView.swift; sourceTree = "<group>"; };
 		E29734A13FFD848BA212FAED /* husk-tl-unity.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "husk-tl-unity.h"; sourceTree = "<group>"; };
 		E3A701AA76E485A6CE15F106 /* icon-cleardark.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "icon-cleardark.png"; sourceTree = "<group>"; };
@@ -386,6 +389,8 @@
 			children = (
 				3ADCEA1477DA816D867C1EBB /* husk-tl-a64.c */,
 				272578DB0CBA40E69B87093D /* husk-tl-a64.h */,
+				D620F10A0861C01571856AD0 /* husk-tl-anon.c */,
+				72C2D1EF041B9252706EC3B6 /* husk-tl-anon.h */,
 				463C342B38F6BF37752F4E72 /* husk-tl-audio.c */,
 				473B239012BE00391A4164ED /* husk-tl-audio.h */,
 				44BAD09F39FA4184F97AB0D0 /* husk-tl-bionic-cxx.c */,
@@ -696,6 +701,7 @@
 				1A97D1F8D5FAFEB3145D4AE5 /* TranslationLayer.swift in Sources */,
 				7EF41C59B3AF51A4E96F20E0 /* fishhook.c in Sources */,
 				AC5C07974C7A8658358A55C9 /* husk-tl-a64.c in Sources */,
+				2CD4AAC16258C1815CFBFCDB /* husk-tl-anon.c in Sources */,
 				80C126C7BDB5EE56A7139C20 /* husk-tl-audio.c in Sources */,
 				2382523F24A95C0E58189C78 /* husk-tl-bionic-cxx.c in Sources */,
 				BA42565FACC0AAC10D8FEAF6 /* husk-tl-bionic-io.c in Sources */,

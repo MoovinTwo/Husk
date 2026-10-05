@@ -9,6 +9,7 @@
  */
 #define _DARWIN_C_SOURCE
 #include "husk-tl-bionic.h"
+#include "husk-tl-anon.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -374,75 +375,21 @@ static int prot_filter(int prot, const char *what)
  * throw the pages away so the next touch finds zeros. Allocators lean on that -- they release a range
  * and expect it to come back clean. Darwin's MADV_DONTNEED keeps the contents, so the pages are
  * replaced with fresh ones at the same protection instead.
- */
-typedef struct { uintptr_t addr; size_t len; } anon_range;
-static anon_range *g_anon;         /* grows: an allocator maps and unmaps all through a game's life */
-static int g_nanon, g_capanon;
-static pthread_mutex_t g_anon_lock = PTHREAD_MUTEX_INITIALIZER;
-
-/* Room for one more entry, under g_anon_lock. When there is none to be had, the range goes unrecorded and
- * MADV_DONTNEED on it keeps its contents, as Darwin's does; that is said once, and the table carries on. */
-static bool anon_room(void)
-{
-    if (g_nanon < g_capanon) return true;
-    int cap = g_capanon ? g_capanon * 2 : 1024;
-    anon_range *n = realloc(g_anon, (size_t)cap * sizeof(anon_range));
-    if (!n) { tl_note_once("mm: the table of anonymous mappings cannot grow; MADV_DONTNEED will not zero new ones"); return false; }
-    g_anon = n; g_capanon = cap;
-    return true;
-}
-
-/* Take [addr, end) out of the table, under g_anon_lock. An entry it cuts through keeps the part on either side. */
-static void anon_cut_locked(uintptr_t addr, uintptr_t end)
-{
-    for (int i = 0; i < g_nanon; i++) {
-        uintptr_t a = g_anon[i].addr, e = a + g_anon[i].len;
-        if (addr >= e || end <= a) continue;
-        if (a < addr && e > end) {                           /* cut out of the middle: two pieces remain */
-            g_anon[i].len = addr - a;
-            if (anon_room()) { g_anon[g_nanon].addr = end; g_anon[g_nanon].len = e - end; g_nanon++; }
-        } else if (a < addr) {
-            g_anon[i].len = addr - a;
-        } else if (e > end) {
-            g_anon[i].addr = end; g_anon[i].len = e - end;
-        } else {
-            g_anon[i] = g_anon[--g_nanon]; i--;
-        }
-    }
-}
-
-/* A new mapping replaces only what it covers: one placed inside a bigger region leaves the rest of that region recorded. */
-static void anon_add_locked(void *addr, size_t len)
-{
-    anon_cut_locked((uintptr_t)addr, (uintptr_t)addr + len);
-    if (anon_room()) { g_anon[g_nanon].addr = (uintptr_t)addr; g_anon[g_nanon].len = len; g_nanon++; }
-}
-
-/*
- * Forget [addr, addr+len) once it is unmapped, or the table fills with ranges that are gone and a later MADV_DONTNEED
- * would map fresh pages over whatever has since taken their place. munmap takes whole pages, so the range is rounded
- * out to them.
  *
- * The caller holds g_anon_lock across the unmapping and this, together. Otherwise another thread can map the same
- * addresses in between, record them, and have its new entry forgotten here.
+ * The table itself is husk-tl-anon.c's. When it cannot grow, the range goes unrecorded and MADV_DONTNEED on it keeps
+ * its contents, as Darwin's does; that is said once, and the table carries on. Both of these are called under
+ * tl_anon_lock.
  */
-static void anon_remove_locked(uintptr_t addr, size_t len)
-{
-    uintptr_t m = (uintptr_t)vm_page_size - 1;          /* the host's page: 16 KiB on a phone, 4 KiB on an Intel Mac */
-    uintptr_t end = addr + len;
-    end = end < addr ? UINTPTR_MAX : (end + m < end ? UINTPTR_MAX : (end + m) & ~m);
-    addr &= ~m;
-    anon_cut_locked(addr, end);
-}
+static void anon_full(void) { tl_note_once("mm: the table of anonymous mappings cannot grow; MADV_DONTNEED will not zero new ones"); }
+static void anon_add_locked(void *addr, size_t len) { if (!tl_anon_add_locked((uintptr_t)addr, len)) anon_full(); }
+static void anon_remove_locked(uintptr_t addr, size_t len) { if (!tl_anon_remove_locked(addr, len)) anon_full(); }
 
 static void anon_zap(uintptr_t addr, size_t len)
 {
     uintptr_t end = addr + len;
-    pthread_mutex_lock(&g_anon_lock);
-    for (int i = 0; i < g_nanon; i++) {
-        uintptr_t a = g_anon[i].addr > addr ? g_anon[i].addr : addr;
-        uintptr_t e = g_anon[i].addr + g_anon[i].len < end ? g_anon[i].addr + g_anon[i].len : end;
-        if (a >= e) continue;
+    tl_anon_lock();
+    uintptr_t a, e;
+    for (int i = 0; tl_anon_next_locked(&i, addr, end, &a, &e);) {
         for (uintptr_t p = a & ~((uintptr_t)vm_page_size - 1); p < e;) {           /* walk the regions in the range */
             vm_address_t ra = p; vm_size_t rs = 0;
             vm_region_basic_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj;
@@ -454,7 +401,7 @@ static void anon_zap(uintptr_t addr, size_t len)
             p = re;
         }
     }
-    pthread_mutex_unlock(&g_anon_lock);
+    tl_anon_unlock();
 }
 
 static int g_mm_trace = -1;
@@ -534,7 +481,7 @@ static void *b_mmap(void *addr, size_t len, int prot, int flags, int fd, long of
     /* A fixed mapping replaces whatever was there, and a file mapping takes its range out of the table: either way the
      * table is updated under the same lock as the mapping, as munmap's is. */
     bool held = (flags & 0x10) || !(flags & 0x20);
-    if (held) pthread_mutex_lock(&g_anon_lock);
+    if (held) tl_anon_lock();
     if (refuse) { tl_log_line("mm: refusing %#zx bytes (TL_MM_MAX_GIB)", len); errno = ENOMEM; }
     void *r = refuse || (force_phantom && len == 2 * PHANTOM_HALF && prot == 0 && (flags & 0x20) && !(flags & 0x10)) ? MAP_FAILED
             : mmap(addr, len, prot_filter(prot, "mmap"), df, (flags & 0x20) ? -1 : fd, off);
@@ -543,10 +490,10 @@ static void *b_mmap(void *addr, size_t len, int prot, int flags, int fd, long of
     TL_ERRNO_END();
     /* Only what is really mapped is recorded (of a phantom range, the real half: the other half is not ours to zap). A
      * file mapping placed over anonymous memory takes that range out of the table. */
-    if (!held) pthread_mutex_lock(&g_anon_lock);
+    if (!held) tl_anon_lock();
     if (r != MAP_FAILED && (flags & 0x20)) anon_add_locked(r, mapped);
     else if (r != MAP_FAILED) anon_remove_locked((uintptr_t)r, len);
-    pthread_mutex_unlock(&g_anon_lock);
+    tl_anon_unlock();
     mm_trace("mmap", r, len, prot, flags);
     if (r == MAP_FAILED) tl_log_line("mm: mmap FAILED len=%#zx prot=%d flags=%#x errno=%d", len, prot, flags, errno);
     return r;
@@ -555,10 +502,10 @@ static int b_munmap(void *a, size_t l)
 {
     size_t real = phantom_clamp((uintptr_t)a, l);
     if (real == 0) return 0;                                 /* the half of a phantom range that was never mapped */
-    pthread_mutex_lock(&g_anon_lock);
+    tl_anon_lock();
     TL_ERRNO_BEGIN(); int r = munmap(a, real); TL_ERRNO_END();
     if (r == 0) anon_remove_locked((uintptr_t)a, real);
-    pthread_mutex_unlock(&g_anon_lock);
+    tl_anon_unlock();
     mm_trace("munmap", a, real, r, errno);
     return r;
 }
@@ -576,10 +523,10 @@ static void *b_mremap(void *old, size_t olds, size_t news, int flags, void *newa
     void *n = mmap(NULL, news, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
     if (n == MAP_FAILED) { tl_set_guest_errno(12); return (void *)-1; }
     memcpy(n, old, olds < news ? olds : news);
-    pthread_mutex_lock(&g_anon_lock);
+    tl_anon_lock();
     anon_add_locked(n, news);
     if (munmap(old, olds) == 0) anon_remove_locked((uintptr_t)old, olds);
-    pthread_mutex_unlock(&g_anon_lock);
+    tl_anon_unlock();
     return n;
 }
 
