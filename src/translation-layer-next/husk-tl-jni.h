@@ -44,9 +44,8 @@ struct jobj {
         struct { jobj **v; uint32_t len; } oarr;
         struct { tl_jclass *jc; } klass;
     };
-    jvalue *fields;                     /* instance fields, indexed by tl_jfield::index */
-    uint32_t nfields;
-    uint64_t refslots;                  /* which of fields[0..63] hold a reference of their own */
+    struct { struct tl_jfield *f; jvalue v; } *fields;    /* instance fields that have been set, in no order */
+    uint32_t nfields, capfields;
     void *native;                       /* an implementation's own state */
     void *monitor;
 };

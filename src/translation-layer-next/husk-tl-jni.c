@@ -28,10 +28,10 @@ typedef struct tl_jmeth {
 } tl_jmeth;
 
 typedef struct tl_jfield {
-    tl_jclass *cls;
+    tl_jclass *cls;                    /* the class that declares it */
     char *name, *sig;
     bool is_static;
-    uint32_t index;
+    uint32_t index;                    /* a static field's slot in cls->statics */
 } tl_jfield;
 
 struct tl_jclass {
@@ -73,6 +73,9 @@ static jobj *obj_alloc(uint8_t kind, tl_jclass *cls)
 
 jobj *tl_jni_ref(jobj *o) { if (o) __atomic_add_fetch(&o->refs, 1, __ATOMIC_RELAXED); return o; }
 
+/* Whether a field holds an object: decided by its type, so it never changes once the field exists. */
+static bool sig_is_obj(const char *sig) { return sig[0] == 'L' || sig[0] == '['; }
+
 void tl_jni_unref(jobj *o)
 {
     if (!o || o->kind == TL_K_CLASS) return;
@@ -87,7 +90,7 @@ void tl_jni_unref(jobj *o)
         break;
     default: break;
     }
-    for (uint32_t i = 0; i < o->nfields && i < 64; i++) if (o->refslots >> i & 1) tl_jni_unref(o->fields[i].l);
+    for (uint32_t i = 0; i < o->nfields; i++) if (sig_is_obj(o->fields[i].f->sig)) tl_jni_unref(o->fields[i].v.l);
     free(o->fields);
     free(o);
 }
@@ -367,74 +370,89 @@ static bool dex_field_real_sig(tl_jclass *cls, const char *name, char *out, size
     return false;
 }
 
+/* An instance field is looked for up the chain of superclasses, so a subclass's ID for an inherited field is its superclass's. */
+static tl_jfield *find_field_locked(tl_jclass *cls, const char *name, const char *sig, bool is_static)
+{
+    for (tl_jclass *c = cls; c; c = is_static ? NULL : c->super)
+        for (int i = 0; i < c->nfields; i++) {
+            tl_jfield *f = c->fields[i];
+            if (f->is_static == is_static && !strcmp(f->name, name) && !strcmp(f->sig, sig)) return f;
+        }
+    return NULL;
+}
+
 static tl_jfield *lookup_field(tl_jclass *cls, const char *name, const char *sig, bool is_static, bool create)
 {
     pthread_mutex_lock(&g_lock);
-    for (int i = 0; i < cls->nfields; i++) {
-        tl_jfield *f = cls->fields[i];
-        if (f->is_static == is_static && !strcmp(f->name, name) && !strcmp(f->sig, sig)) { pthread_mutex_unlock(&g_lock); return f; }
-    }
+    tl_jfield *f = find_field_locked(cls, name, sig, is_static);
     pthread_mutex_unlock(&g_lock);
-    if (!create) {
-        /* Existence: an app class's fields can be checked; a framework class's are believed. */
-        bool found = false;
-        for (tl_jclass *c = cls; c && !found; c = c->super) {
-            if (c->in_dex) found = tl_dexidx_declares_field(c->name, name, sig, NULL);
-            else if (strcmp(c->name, "java/lang/Object")) found = true;
-        }
-        if (!found) return NULL;
+    if (f) return f;
+    /* Existence: an app class's fields can be checked; a framework class's are believed. An instance field
+     * belongs to the app class that declares it, so that asking its superclass later finds the same one. */
+    tl_jclass *owner = cls;
+    bool found = false;
+    for (tl_jclass *c = cls; c && !found; c = c->super) {
+        if (c->in_dex) { if ((found = tl_dexidx_declares_field(c->name, name, sig, NULL)) && !is_static) owner = c; }
+        else if (strcmp(c->name, "java/lang/Object")) found = true;
     }
-    tl_jfield *f = calloc(1, sizeof(*f));
-    f->cls = cls; f->name = strdup(name); f->sig = strdup(sig); f->is_static = is_static;
+    if (!create && !found) return NULL;
+    f = calloc(1, sizeof(*f));
+    f->cls = owner; f->name = strdup(name); f->sig = strdup(sig); f->is_static = is_static;
     pthread_mutex_lock(&g_lock);
-    f->index = (uint32_t)(is_static ? cls->nstatics++ : cls->nfields - 0);
     if (is_static) {
-        cls->statics = realloc(cls->statics, (size_t)cls->nstatics * sizeof(jvalue));
-        memset(&cls->statics[cls->nstatics - 1], 0, sizeof(jvalue));
-    } else {
-        uint32_t ni = 0;
-        for (int i = 0; i < cls->nfields; i++) if (!cls->fields[i]->is_static) ni++;
-        f->index = ni;
+        f->index = (uint32_t)owner->nstatics++;
+        owner->statics = realloc(owner->statics, (size_t)owner->nstatics * sizeof(jvalue));
+        memset(&owner->statics[owner->nstatics - 1], 0, sizeof(jvalue));
     }
-    if (cls->nfields == cls->capf) { cls->capf = cls->capf ? cls->capf * 2 : 8; cls->fields = realloc(cls->fields, (size_t)cls->capf * sizeof(*cls->fields)); }
-    cls->fields[cls->nfields++] = f;
+    if (owner->nfields == owner->capf) { owner->capf = owner->capf ? owner->capf * 2 : 8; owner->fields = realloc(owner->fields, (size_t)owner->capf * sizeof(*owner->fields)); }
+    owner->fields[owner->nfields++] = f;
     pthread_mutex_unlock(&g_lock);
     return f;
 }
 
-static jvalue *field_slot(jobj *o, tl_jfield *f)
+/* Where a field's value lives: a static's in its class, an instance field's in the object, made there when `make`. */
+static jvalue *field_slot(jobj *o, tl_jfield *f, bool make)
 {
     if (f->is_static) return &f->cls->statics[f->index];
-    if (f->index >= o->nfields) {
-        uint32_t n = f->index + 8;
-        o->fields = realloc(o->fields, n * sizeof(jvalue));
-        memset(o->fields + o->nfields, 0, (n - o->nfields) * sizeof(jvalue));
-        o->nfields = n;
+    for (uint32_t i = 0; i < o->nfields; i++) if (o->fields[i].f == f) return &o->fields[i].v;
+    if (!make) return NULL;
+    if (o->nfields == o->capfields) {
+        o->capfields = o->capfields ? o->capfields * 2 : 4;
+        o->fields = realloc(o->fields, o->capfields * sizeof(*o->fields));
     }
-    return &o->fields[f->index];
+    o->fields[o->nfields].f = f;
+    o->fields[o->nfields].v.j = 0;
+    return &o->fields[o->nfields++].v;
 }
 
 /*
- * An object field owns its value: it takes the reference it is given (`is_obj`) and releases the one it
- * held. Two classes of one object number their fields independently, so a slot can be an object field
- * through one and a number through the other; an instance slot is therefore released only when it is
- * marked as holding a reference, which also lets the object release its fields when it goes. A slot past
- * the 64 the mark covers keeps what it is given.
+ * An object field owns its value: it takes the reference it is given and releases the one it held. Whether a
+ * field is one comes from its type; a Set of the other kind (SetIntField on an object field, say), which ART's
+ * checks abort on, is dropped rather than let a number be released as an object later.
  */
 static void store_value(jobj *o, tl_jfield *f, bool is_obj, jvalue v)
 {
-    jvalue *slot = field_slot(o, f);
-    jobj *old = NULL;
-    if (f->is_static) old = is_obj ? slot->l : NULL;
-    else if (f->index < 64) {
-        uint64_t bit = 1ull << f->index;
-        if (o->refslots & bit) old = slot->l;
-        o->refslots = is_obj ? o->refslots | bit : o->refslots & ~bit;
+    bool ref = sig_is_obj(f->sig);
+    if (is_obj != ref) {
+        TRACE("jni: Set%sField on %s %s, a field of the other kind; ignored", is_obj ? "Object" : "<primitive>", f->name, f->sig);
+        if (is_obj) tl_jni_unref(v.l);
+        return;
     }
+    jvalue *slot = field_slot(o, f, true);
+    jobj *old = ref ? slot->l : NULL;
     *slot = v;
     tl_jni_unref(old);
 }
-static bool sig_is_obj(const char *sig) { return sig[0] == 'L' || sig[0] == '['; }
+
+/* A field's value. With `is_obj` an object comes back as a new reference, and a field that holds none gives NULL. */
+static jvalue load_value(jobj *o, tl_jfield *f, bool is_obj)
+{
+    jvalue v; v.j = 0;
+    jvalue *slot = field_slot(o, f, false);
+    if (slot) v = *slot;
+    if (is_obj) v.l = sig_is_obj(f->sig) ? tl_jni_ref(v.l) : NULL;
+    return v;
+}
 
 void tl_jni_set_field(jobj *o, const char *name, const char *sig, jvalue v)
 {
@@ -444,7 +462,7 @@ void tl_jni_set_field(jobj *o, const char *name, const char *sig, jvalue v)
 jvalue tl_jni_get_field(jobj *o, const char *name, const char *sig)
 {
     tl_jfield *f = lookup_field(o->cls, name, sig, false, true);
-    return *field_slot(o, f);
+    return load_value(o, f, false);
 }
 void tl_jni_set_static(const char *cls, const char *name, const char *sig, jvalue v)
 {
@@ -456,7 +474,7 @@ jvalue tl_jni_get_static(const char *cls, const char *name, const char *sig)
 {
     tl_jclass *c = tl_jni_class(cls);
     tl_jfield *f = lookup_field(c, name, sig, true, true);
-    return *field_slot(NULL, f);
+    return load_value(NULL, f, false);
 }
 
 /* ------------------------------------------------------------- exceptions */
@@ -840,15 +858,16 @@ static jo jni_ToReflectedField(void *env, jo cls, void *fid, uint8_t is_static)
 }
 
 /* Reading an object field gives native code a local of its own; writing any field goes through store_value. */
-#define REF_Object(x) ((jo)tl_jni_local(tl_jni_ref((jo)(x))))
-#define REF_Boolean(x) (x)
-#define REF_Byte(x) (x)
-#define REF_Char(x) (x)
-#define REF_Short(x) (x)
-#define REF_Int(x) (x)
-#define REF_Long(x) (x)
-#define REF_Float(x) (x)
-#define REF_Double(x) (x)
+#define GET_Object(o, fid, F) ((jo)tl_jni_local(load_value((o), (fid), true).l))
+#define GET_PRIM(o, fid, F) (load_value((o), (fid), false).F)
+#define GET_Boolean GET_PRIM
+#define GET_Byte GET_PRIM
+#define GET_Char GET_PRIM
+#define GET_Short GET_PRIM
+#define GET_Int GET_PRIM
+#define GET_Long GET_PRIM
+#define GET_Float GET_PRIM
+#define GET_Double GET_PRIM
 #define PUT_Object(o, fid, F, v) do { jvalue n_; n_.j = 0; n_.l = tl_jni_ref(v); store_value((o), (fid), true, n_); } while (0)
 #define PUT_PRIM(o, fid, F, v) do { jvalue n_; n_.j = 0; n_.F = (v); store_value((o), (fid), false, n_); } while (0)
 #define PUT_Boolean PUT_PRIM
@@ -860,9 +879,9 @@ static jo jni_ToReflectedField(void *env, jo cls, void *fid, uint8_t is_static)
 #define PUT_Float PUT_PRIM
 #define PUT_Double PUT_PRIM
 #define GEN_FIELDS(T, CT, F) \
-    static CT jni_Get##T##Field(void *env, jo o, void *fid) { (void)env; return (CT)REF_##T(field_slot(o, fid)->F); } \
+    static CT jni_Get##T##Field(void *env, jo o, void *fid) { (void)env; return (CT)GET_##T(o, fid, F); } \
     static void jni_Set##T##Field(void *env, jo o, void *fid, CT v) { (void)env; PUT_##T(o, fid, F, v); } \
-    static CT jni_GetStatic##T##Field(void *env, jo c, void *fid) { (void)env; (void)c; return (CT)REF_##T(field_slot(NULL, fid)->F); } \
+    static CT jni_GetStatic##T##Field(void *env, jo c, void *fid) { (void)env; (void)c; return (CT)GET_##T(NULL, fid, F); } \
     static void jni_SetStatic##T##Field(void *env, jo c, void *fid, CT v) { (void)env; (void)c; PUT_##T(NULL, fid, F, v); }
 JV_TYPES(GEN_FIELDS)
 
