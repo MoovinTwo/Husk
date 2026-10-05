@@ -196,6 +196,31 @@ executable region's writable view so that a site with no stub pool in branch
 range can still be given `adrp Xt, <shared block>`; the others are plain
 `mmap`ed data.
 
+The same blocks hold ELF TLS, laid out as bionic lays out static TLS on arm64
+(variant 1, `StaticTlsLayout` in bionic's `bionic_elf_tls.cpp`): after the
+eight slots at TP+0..63, each module's `PT_TLS` block at a TP offset assigned
+when the module is mapped, rounded up to its `p_align` with its
+`p_vaddr % p_align` skew kept. Every block has the same area for this,
+256 KiB by default (`TL_STATIC_TLS_KB`); a module that does not fit is refused
+with a message saying so, as is one asking for more than 4096-byte alignment,
+which is what TP is aligned to. bionic gives libraries `dlopen`ed after
+start-up dynamic TLS; here every module is static, so:
+
+- `R_AARCH64_TLS_TPREL64` (initial-exec) is the module's offset + the
+  symbol's + the addend;
+- `R_AARCH64_TLSDESC` gets bionic's static resolver (`ldr x0, [x0, #8]; ret`)
+  and that TP offset, or for an undefined weak symbol a resolver that returns
+  the addend minus this thread's TP, so the address comes out as the addend;
+- `R_AARCH64_TLS_DTPMOD64`/`DTPREL64` give a module id and an offset for
+  `__tls_get_addr`, which the shim answers as TP + the module's offset + the
+  offset.
+
+TLS symbols resolve as bionic resolves them: the library itself for its own
+definitions and for symbol 0, otherwise its scope. A module's `.tdata`/`.tbss`
+image is copied, after relocation, into every block that exists and then into
+each new block. Threads that share the fallback block share its thread-locals
+too.
+
 ### x18: measured on the phone
 
 Clang reserves x18 for both Android and iOS targets (checked: it allocates x18

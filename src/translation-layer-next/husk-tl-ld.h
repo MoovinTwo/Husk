@@ -28,6 +28,16 @@
  * through TPIDRRO_EL0 as the virtual x18 is, and falls back to one block shared by
  * threads that have none. Blocks hold bionic's eight slots at TP+0..63 with one
  * random cookie per process; see tl_ld_thread_attach.
+ *
+ * ELF TLS follows bionic's arm64 static layout (variant 1): after the slots,
+ * each module's PT_TLS block at a TP offset fixed when it is mapped, aligned to
+ * its p_align with its p_vaddr skew kept, in an area every block has
+ * (TL_STATIC_TLS_KB, 256 KiB by default; a module that does not fit, or wants
+ * more than 4096-byte alignment, is refused). All modules are static, even those
+ * loaded late, so R_AARCH64_TLS_TPREL64 is a constant offset, TLSDESC resolves
+ * through bionic's static resolver, and __tls_get_addr is one addition. A
+ * module's .tdata/.tbss image is copied into every block when the module is
+ * relocated and into each block made after.
  */
 #ifndef HUSK_TL_LD_H
 #define HUSK_TL_LD_H
@@ -106,6 +116,10 @@ void tl_vx18_set(uint64_t v);
  */
 bool tl_ld_thread_attach(void);
 void tl_ld_thread_detach(void);
+
+/* bionic's __tls_get_addr, for the general-dynamic accesses that do not use TLSDESC: the calling thread's copy. */
+typedef struct { size_t module, offset; } tl_tls_index;
+void *tl_ld_tls_get_addr(const tl_tls_index *ti);
 
 /* Imports that nothing provided, bound to a stub that logs on call. */
 size_t tl_ld_unresolved_count(void);
