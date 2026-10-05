@@ -576,10 +576,15 @@ static void check_dualmap(tl_json *j, size_t page, tl_dual_mapping *stik)
                "No debugger-granted dual mapping is active in this process.");
         return;
     }
+    /* A page of its own, not one at a fixed offset: every other byte of the
+     * region may be QEMU's or a loaded game's code. */
+    uint8_t *rw = NULL, *rx = NULL;
+    if (!tl_jit_carve(page, &rx, &rw)) {
+        result(j, "dualmap", title, "skip",
+               "The debugger-granted region has no page left to test with.");
+        return;
+    }
     starting("dualmap");
-    size_t test_off = stik->size - 2 * page;
-    uint8_t *rw = stik->rw_addr + test_off;
-    uint8_t *rx = stik->rx_addr + test_off;
 
     uint32_t code[2] = { 0x52800540u, 0xD65F03C0u }; /* movz w0, #42; ret */
     memcpy(rw, code, sizeof(code));

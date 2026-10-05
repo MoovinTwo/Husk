@@ -27,7 +27,11 @@ static struct {
 } g_x = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
 #if defined(__APPLE__) && !TARGET_OS_OSX
-/* The phone: StikDebug's region. Found through the allocator that asked for it. */
+#define TL_XMEM_SHARED 1
+/* The phone: StikDebug's region. Found through the allocator that asked for it.
+ * Only its bounds are kept here, for the range checks below: QEMU and the old
+ * loader take slices of the same region, so every allocation is carved from the
+ * JIT library's shared allocator rather than from a bump pointer of our own. */
 static bool open_platform(size_t host_bytes, char *err, size_t errlen)
 {
     (void)host_bytes;
@@ -113,12 +117,19 @@ bool tl_xmem_alloc(size_t bytes, uint8_t **rx, uint8_t **rw)
     size_t n = (bytes + TL_XMEM_PAGE - 1) & ~(size_t)(TL_XMEM_PAGE - 1);
     bool ok = false;
     pthread_mutex_lock(&g_x.lock);
+#ifdef TL_XMEM_SHARED
+    if (g_x.open && tl_jit_carve(n, rx, rw)) {
+        g_x.used += n;
+        ok = true;
+    }
+#else
     if (g_x.open && n <= g_x.size - g_x.used) {
         if (rx) *rx = g_x.rx + g_x.used;
         if (rw) *rw = g_x.rw + g_x.used;
         g_x.used += n;
         ok = true;
     }
+#endif
     pthread_mutex_unlock(&g_x.lock);
     return ok;
 }

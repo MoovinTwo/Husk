@@ -66,7 +66,15 @@ typedef struct tl_dual_mapping {
     size_t   size;
 } tl_dual_mapping;
 
+/* The whole StikDebug region, prewarming it first if nothing has yet; NULL when
+ * there is none. Its bounds are for range checks: space in it is taken with
+ * tl_jit_carve(), because QEMU and both loaders all draw from it. */
 tl_dual_mapping *tl_find_stikdebug_prewarmed(void);
+
+/* Take `bytes` (rounded up to 16 KiB pages) from that region through the JIT
+ * library's shared allocator. False when there is no region, the allocator is
+ * not linked into this process, or the slice does not fit. */
+bool tl_jit_carve(size_t bytes, uint8_t **rx, uint8_t **rw);
 
 /* ------------------------------------------------------------------- ZIP */
 

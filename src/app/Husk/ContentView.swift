@@ -217,6 +217,15 @@ struct ContentView: View {
     private func start() {
         guard !started else { return }
         guard JITBootstrap.isDebuggerAttached else { return }
+        // A native game and QEMU each take their own slice of the one JIT region,
+        // but two emulators in one process still compete for that region and for
+        // memory jetsam counts, and the game cannot be unloaded to make room. So
+        // only one of them runs per launch.
+        guard husk_unity_state() == Int32(HUSK_UNITY_IDLE) else {
+            HuskLog.log("jit", "refusing to start QEMU: a native game was started "
+                             + "this launch; restart Husk to boot the guest")
+            return
+        }
         HuskLog.log("ui", "CS_DEBUGGED set; starting QEMU")
         // Take the JIT region at the last moment before QEMU, as well as before
         // the download. Whichever comes first wins; the second call is a no-op.

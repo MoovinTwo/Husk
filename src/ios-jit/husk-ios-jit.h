@@ -72,7 +72,9 @@ HUSK_EXPORT void husk_ios_jit_install_trap_handler(void);
 /*
  * Allocate one dual-mapped region of `bytes`. Returns a mapping whose rw_addr is
  * NULL on failure. `bytes` is rounded up to a 16 KiB page multiple by the caller's
- * contract -- StikDebug prepares whole pages.
+ * contract -- StikDebug prepares whole pages. Once the region has been
+ * prewarmed this carves exactly `bytes` from it rather than handing over the
+ * whole of it, so the rest stays available to the translation layer.
  */
 HuskDualMapping husk_ios_jit_allocate(size_t bytes);
 
@@ -85,7 +87,37 @@ HuskDualMapping husk_ios_jit_allocate(size_t bytes);
  */
 HUSK_EXPORT bool husk_ios_jit_prewarm(size_t bytes);
 
-/* Release a mapping obtained from husk_ios_jit_allocate(). */
+/*
+ * Who owns the region
+ * -------------------
+ * The prewarmed region is the only executable memory there will ever be, and
+ * more than one client wants a piece of it: QEMU's translation buffer and the
+ * translation layer's loaders. Each of them used to assume it had the whole
+ * region to itself and wrote from its first byte, so whichever ran second
+ * overwrote the other's code. The region is therefore handed out only through
+ * this bump allocator, which gives every caller its own disjoint slice.
+ * Nothing is ever given back: a hole could not be reused by anything that
+ * needed contiguous space anyway, and there is no second region to fall back on.
+ *
+ * Take `bytes` (rounded up to whole 16 KiB pages) from the prewarmed region.
+ * On success `*rx` is where the slice executes and `*rw` where it is written;
+ * either pointer may be NULL. Returns false, and logs why, when there is no
+ * prewarmed region or the slice does not fit in what is left. Thread-safe.
+ */
+HUSK_EXPORT bool husk_ios_jit_carve(size_t bytes, uint8_t **rx, uint8_t **rw);
+
+/*
+ * The whole prewarmed region, or NULL when there is none. For range checks
+ * only: memory inside it belongs to whoever carved it, so take space with
+ * husk_ios_jit_carve() rather than writing here directly.
+ */
+HUSK_EXPORT const HuskDualMapping *husk_ios_jit_get_mapping(void);
+
+/* Bytes of the prewarmed region not yet carved; 0 when there is none. */
+HUSK_EXPORT size_t husk_ios_jit_remaining(void);
+
+/* Release a mapping obtained from husk_ios_jit_allocate(). A slice of the
+ * prewarmed region is only forgotten, not unmapped: its neighbours are in use. */
 void husk_ios_jit_release(HuskDualMapping *m);
 
 /*

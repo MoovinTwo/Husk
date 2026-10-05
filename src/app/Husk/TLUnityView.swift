@@ -128,6 +128,13 @@ final class TLUnityUIView: UIView, UIKeyInput {
             HuskLog.log("tl", "unity: already started; resuming")
             return
         }
+        // The other half of ContentView.start()'s check: QEMU and a native game
+        // never share a launch, and QEMU cannot be stopped to make room.
+        if QemuRunner.shared.isRunning {
+            HuskLog.log("jit", "native: refusing to launch \(apk) while QEMU is running; "
+                             + "restart Husk to play it")
+            return
+        }
         if engine != .unity {
             // The game plays through the silent switch, like the guest's own audio, and mixes with other audio.
             let session = AVAudioSession.sharedInstance()

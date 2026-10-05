@@ -12,6 +12,28 @@
 #include <TargetConditionals.h>
 #endif
 
+/*
+ * The arithmetic of husk_ios_jit_carve(), kept apart from the locking and the
+ * mapping so a host test can check it without a phone. Takes `bytes`, rounded up
+ * to whole 16 KiB pages, from a region of `size` of which `*used` is already
+ * gone, and says where the slice starts. Fails on an empty request, on a
+ * rounding overflow and when the slice does not fit.
+ */
+#define HUSK_JIT_PAGE ((size_t)16384)
+
+/* Unused off iOS, where the stubs below have no region to carve from. */
+static inline __attribute__((unused))
+bool husk_jit_bump(size_t size, size_t *used, size_t bytes, size_t *offset)
+{
+    size_t n = (bytes + HUSK_JIT_PAGE - 1) & ~(HUSK_JIT_PAGE - 1);
+    if (bytes == 0 || n < bytes || *used > size || n > size - *used) {
+        return false;
+    }
+    *offset = *used;
+    *used += n;
+    return true;
+}
+
 #if defined(__APPLE__) && TARGET_OS_IPHONE
 
 #include <errno.h>
@@ -19,6 +41,7 @@
 #include <mach/vm_map.h>        /* vm_remap/vm_protect: mach_vm.h is absent from the iOS SDK */
 #include <os/log.h>
 #include <os/proc.h>
+#include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -298,33 +321,104 @@ static bool husk_jit_selftest(const HuskDualMapping *m)
  * and held until QEMU asks for it.
  */
 static HuskDualMapping husk_ios_jit_allocate_real(size_t bytes);
+static void husk_unmap(HuskDualMapping *m);
 
+/*
+ * Everything below is guarded by husk_region_lock. Prewarm runs from the app's
+ * launch path while QEMU and the translation layer may be asking for space on
+ * their own threads, and a plain flag let two of them both decide they were
+ * first and trap twice.
+ */
+static pthread_mutex_t husk_region_lock = PTHREAD_MUTEX_INITIALIZER;
 static HuskDualMapping husk_prewarmed;
+static size_t husk_prewarmed_used;
 static bool husk_prewarm_done;
 
 HUSK_EXPORT bool husk_ios_jit_prewarm(size_t bytes)
 {
-    if (husk_prewarm_done) {
-        return husk_prewarmed.rw_addr != NULL;
+    /* Held across the trap on purpose: anyone asking for space meanwhile
+     * should wait for the region rather than conclude there is none. */
+    pthread_mutex_lock(&husk_region_lock);
+    if (!husk_prewarm_done) {
+        husk_prewarm_done = true;
+        husk_prewarmed = husk_ios_jit_allocate_real(bytes);
+        fprintf(stderr, "[husk-jit] prewarm %s: %zu bytes\n",
+                husk_prewarmed.rw_addr ? "OK" : "FAILED", bytes);
     }
-    husk_prewarm_done = true;
-    husk_prewarmed = husk_ios_jit_allocate_real(bytes);
-    fprintf(stderr, "[husk-jit] prewarm %s: %zu bytes\n",
-            husk_prewarmed.rw_addr ? "OK" : "FAILED", bytes);
-    return husk_prewarmed.rw_addr != NULL;
+    bool ok = husk_prewarmed.rw_addr != NULL;
+    pthread_mutex_unlock(&husk_region_lock);
+    return ok;
+}
+
+HUSK_EXPORT bool husk_ios_jit_carve(size_t bytes, uint8_t **rx, uint8_t **rw)
+{
+    size_t offset = 0, left = 0, size = 0;
+    bool have, ok = false;
+
+    pthread_mutex_lock(&husk_region_lock);
+    have = husk_prewarmed.rw_addr != NULL;
+    if (have) {
+        ok = husk_jit_bump(husk_prewarmed.size, &husk_prewarmed_used, bytes,
+                           &offset);
+        if (ok) {
+            if (rx) { *rx = husk_prewarmed.rx_addr + offset; }
+            if (rw) { *rw = husk_prewarmed.rw_addr + offset; }
+        }
+        size = husk_prewarmed.size;
+        left = size - husk_prewarmed_used;
+    }
+    pthread_mutex_unlock(&husk_region_lock);
+
+    if (!have) {
+        HUSK_LOG("carve: no prewarmed region to take %zu bytes from", bytes);
+    } else if (!ok) {
+        HUSK_LOG("carve: %zu bytes do not fit -- %zu of the region's %zu are left",
+                 bytes, left, size);
+    } else {
+        HUSK_LOG("carve: %zu bytes at offset %zu (%zu left)", bytes, offset, left);
+    }
+    return ok;
+}
+
+HUSK_EXPORT const HuskDualMapping *husk_ios_jit_get_mapping(void)
+{
+    pthread_mutex_lock(&husk_region_lock);
+    const HuskDualMapping *m = husk_prewarmed.rw_addr ? &husk_prewarmed : NULL;
+    pthread_mutex_unlock(&husk_region_lock);
+    return m;
+}
+
+HUSK_EXPORT size_t husk_ios_jit_remaining(void)
+{
+    pthread_mutex_lock(&husk_region_lock);
+    size_t left = husk_prewarmed.rw_addr
+                ? husk_prewarmed.size - husk_prewarmed_used : 0;
+    pthread_mutex_unlock(&husk_region_lock);
+    return left;
 }
 
 HuskDualMapping husk_ios_jit_allocate(size_t bytes)
 {
+    HuskDualMapping m = { NULL, NULL, 0 };
+
+    pthread_mutex_lock(&husk_region_lock);
+    bool done = husk_prewarm_done;
+    bool have = husk_prewarmed.rw_addr != NULL;
+    pthread_mutex_unlock(&husk_region_lock);
+
     /*
-     * Hand back the prewarmed region when it is big enough. QEMU asks for
-     * exactly tb-size, which is what prewarm was given, so this is the normal
-     * path -- the fallback below only runs if prewarm never happened.
+     * Carve QEMU's buffer out of the prewarmed region instead of handing it the
+     * whole thing. Prewarm claims more than tb-size so the translation layer
+     * has room too, and TCG treats whatever size it is given as its own to
+     * write over.
      */
-    if (husk_prewarmed.rw_addr && husk_prewarmed.size >= bytes) {
-        fprintf(stderr, "[husk-jit] using the prewarmed region (%zu bytes)\n",
-                husk_prewarmed.size);
-        return husk_prewarmed;
+    if (have) {
+        if (husk_ios_jit_carve(bytes, &m.rx_addr, &m.rw_addr)) {
+            m.size = (bytes + HUSK_JIT_PAGE - 1) & ~(HUSK_JIT_PAGE - 1);
+            fprintf(stderr, "[husk-jit] carved %zu bytes from the prewarmed region\n",
+                    m.size);
+        }
+        return m;
     }
     /*
      * No second trap after a prewarm already went unanswered.
@@ -333,10 +427,9 @@ HuskDualMapping husk_ios_jit_allocate(size_t bytes)
      * stopped on the brk, so the app freezes. Failing here lets region.c
      * fall back to MAP_JIT, or lets qemu_init report the error.
      */
-    if (husk_prewarm_done) {
+    if (done) {
         fprintf(stderr, "[husk-jit] prewarm failed earlier; not trapping again\n");
-        HuskDualMapping none = { NULL, NULL, 0 };
-        return none;
+        return m;
     }
     return husk_ios_jit_allocate_real(bytes);
 }
@@ -425,6 +518,9 @@ static HuskDualMapping husk_ios_jit_allocate_real(size_t bytes)
     if (kr != KERN_SUCCESS) {
         HUSK_LOG("#%llu: vm_remap failed for rx=%p size=%zu: %d (%s)",
                  (unsigned long long)n, rx, bytes, (int)kr, mach_error_string(kr));
+        /* The RX half is useless without its alias, and nothing else will
+         * ever free it. */
+        vm_deallocate(mach_task_self(), (vm_address_t)rx, (vm_size_t)bytes);
         return region;
     }
 
@@ -453,7 +549,7 @@ static HuskDualMapping husk_ios_jit_allocate_real(size_t bytes)
                  "Refusing to hand it to TCG; QEMU would crash on its first "
                  "generated block instead of failing here.",
                  (unsigned long long)n);
-        husk_ios_jit_release(&region);
+        husk_unmap(&region);
         return region;
     }
 
@@ -465,6 +561,24 @@ void husk_ios_jit_release(HuskDualMapping *m)
     if (m == NULL) {
         return;
     }
+    /* A slice of the prewarmed region shares its mapping with every other
+     * slice, so unmapping it would pull code out from under them. */
+    pthread_mutex_lock(&husk_region_lock);
+    bool carved = husk_prewarmed.rx_addr != NULL &&
+                  m->rx_addr >= husk_prewarmed.rx_addr &&
+                  m->rx_addr < husk_prewarmed.rx_addr + husk_prewarmed.size;
+    pthread_mutex_unlock(&husk_region_lock);
+    if (carved) {
+        m->rw_addr = NULL;
+        m->rx_addr = NULL;
+        m->size = 0;
+        return;
+    }
+    husk_unmap(m);
+}
+
+static void husk_unmap(HuskDualMapping *m)
+{
     if (m->rw_addr != NULL) {
         vm_deallocate(mach_task_self(), (vm_address_t)m->rw_addr, (vm_size_t)m->size);
         m->rw_addr = NULL;
@@ -636,6 +750,13 @@ HuskDualMapping husk_ios_jit_allocate(size_t bytes)
     return husk_ios_jit_allocate_real(bytes);
 }
 bool husk_ios_jit_prewarm(size_t bytes) { (void)bytes; return false; }
+bool husk_ios_jit_carve(size_t bytes, uint8_t **rx, uint8_t **rw)
+{
+    (void)bytes; (void)rx; (void)rw;
+    return false;
+}
+const HuskDualMapping *husk_ios_jit_get_mapping(void) { return NULL; }
+size_t husk_ios_jit_remaining(void) { return 0; }
 void husk_ios_jit_release(HuskDualMapping *m) { (void)m; }
 void husk_ios_jit_detach(void) {}
 bool husk_ios_jit_is_available(void) { return false; }
