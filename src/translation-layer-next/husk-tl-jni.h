@@ -47,6 +47,7 @@ struct jobj {
     struct { struct tl_jfield *f; jvalue v; } *fields;    /* instance fields that have been set, in no order */
     uint32_t nfields, capfields;
     void *native;                       /* an implementation's own state */
+    void (*finalize)(jobj *o);          /* releases `native` as the object goes, when it is the object's alone */
     void *monitor;
 };
 

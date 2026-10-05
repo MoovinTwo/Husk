@@ -30,6 +30,7 @@ static jvalue vj(int64_t j) { jvalue v; v.j = j; return v; }
 static jvalue vf(float f) { jvalue v; v.j = 0; v.f = f; return v; }
 static jvalue vz(int z) { jvalue v; v.j = 0; v.z = z != 0; return v; }
 static const motion *M_(const tl_jcall *c) { return c->self ? c->self->native : NULL; }
+static void motion_free(jobj *o) { free(o->native); }       /* each event has its own copy */
 
 static int pidx(const motion *m, int i) { return i >= 0 && i < m->count ? i : 0; }
 
@@ -82,6 +83,7 @@ static void ME_obtainCopy(tl_jcall *c)
     motion *copy = malloc(sizeof(*copy));
     memcpy(copy, m, sizeof(*copy));
     o->native = copy;
+    o->finalize = motion_free;
     c->ret.l = o;
 }
 static void ME_recycle(tl_jcall *c) { (void)c; }
@@ -98,6 +100,7 @@ jobj *tl_input_motion_event(int action, int count, const int *ids, const float *
     m->event_ms = event_ms;
     jobj *o = tl_jni_new_object(tl_jni_class("android/view/MotionEvent"));
     o->native = m;
+    o->finalize = motion_free;
     return o;
 }
 

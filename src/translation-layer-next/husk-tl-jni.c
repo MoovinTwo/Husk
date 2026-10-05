@@ -97,6 +97,7 @@ void tl_jni_unref(jobj *o)
         break;
     default: break;
     }
+    if (o->finalize) o->finalize(o);
     for (uint32_t i = 0; i < o->nfields; i++) if (sig_is_obj(o->fields[i].f->sig)) tl_jni_unref(o->fields[i].v.l);
     free(o->fields);
     free(o);
