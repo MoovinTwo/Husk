@@ -1,8 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 import SwiftUI
 
 struct DiscoverTab: View {
     @ObservedObject private var manager = SourceManager.shared
     @ObservedObject private var host = AndroidHost.shared
+    /// Brings the Android screen to the front once an app has been launched.
+    let onOpenGuest: () -> Void
 
     @State private var showingSources = false
     @State private var showingAddSource = false
@@ -183,10 +186,13 @@ struct DiscoverTab: View {
             let progress = manager.downloadProgress[app.bundleIdentifier]
 
             if isInstalled {
+                // The Library's launch path: it starts whatever activity the app declares for
+                // the launcher (not every app's is <package>.MainActivity), runs the shell call
+                // off the main thread, and then brings Android to the front.
                 Button("OPEN") {
-                    let intent = "am start -n \(app.bundleIdentifier)/\(app.bundleIdentifier).MainActivity"
-                    _ = try? GuestBridge.shared.shell(intent, timeout: 5)
+                    host.launch(app.bundleIdentifier) { onOpenGuest() }
                 }
+                .disabled(!host.isReady || host.busy != nil)
                 .font(.subheadline.bold())
                 .padding(.horizontal, 16).padding(.vertical, 8)
                 .background(Theme.surfaceHigh).foregroundStyle(Theme.text)
