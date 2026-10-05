@@ -21,6 +21,8 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 
+#include "husk-tl-guest.h"
+#include "husk-tl-jni.h"
 #include "husk-tl-ld.h"
 #include "husk-tl-va.h"
 
@@ -249,6 +251,43 @@ static void describe_caller(void *lr, char *out, size_t n)
 
 /* When set, a guest exit() ends the guest, not the app that is hosting it. The hook does not return. */
 void (*tl_guest_exit_hook)(int status);
+
+/* ------------------------------------------------------- landing pads (husk-tl-guest.h) */
+
+static atomic_bool g_guest_ended;
+static __thread tl_guest_pad *t_pad;           /* the innermost pad of this thread */
+static __thread bool t_guest_thread;           /* started by the guest: its pads are never landed on */
+
+bool tl_guest_ended(void) { return atomic_load_explicit(&g_guest_ended, memory_order_acquire); }
+void tl_guest_thread_mark(void) { t_guest_thread = true; }
+
+bool tl_guest_pad_push(tl_guest_pad *p)
+{
+    if (tl_guest_ended()) return false;
+    p->prev = t_pad;
+    p->jni_depth = tl_jni_local_depth();
+    p->landed = 0;
+    t_pad = p;
+    return true;
+}
+
+void tl_guest_pad_pop(tl_guest_pad *p)
+{
+    /* After a landing the frames the abandoned calls pushed, theirs and the guest's, were never popped. */
+    if (p->landed) tl_jni_local_unwind(p->jni_depth);
+    t_pad = p->prev;
+}
+
+void tl_guest_unwind(void)
+{
+    atomic_store_explicit(&g_guest_ended, true, memory_order_release);
+    if (t_guest_thread || !t_pad) return;
+    tl_guest_pad *p = t_pad;
+    while (p->prev) p = p->prev;               /* the outermost: see husk-tl-guest.h for why not the innermost */
+    p->landed = 1;
+    t_pad = p;
+    siglongjmp(p->jb, 1);
+}
 
 /*
  * The guest ending itself the hard way: abort(), _exit(), or SIGABRT or SIGKILL raised on its own process. On Android

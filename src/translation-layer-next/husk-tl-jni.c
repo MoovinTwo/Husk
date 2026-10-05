@@ -164,6 +164,10 @@ void tl_jni_local_pop(void)
     while (t_nlf >= k) lf_pop();
 }
 
+uint32_t tl_jni_local_depth(void) { return t_nlf; }
+
+void tl_jni_local_unwind(uint32_t depth) { while (t_nlf > depth) lf_pop(); }
+
 /* DetachCurrentThread: the thread's locals go. Not while a native call on it is still running, which ART refuses. */
 static void locals_detach(void)
 {

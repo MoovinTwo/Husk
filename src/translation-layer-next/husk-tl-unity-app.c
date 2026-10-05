@@ -14,11 +14,13 @@
 #include <sys/ucontext.h>
 #include <unistd.h>
 #include <TargetConditionals.h>
+#include <CoreFoundation/CoreFoundation.h>
 #if TARGET_OS_IPHONE
 #include <os/proc.h>
 #endif
 
 #include "husk-tl-bionic.h"
+#include "husk-tl-guest.h"
 #include "husk-tl-internal.h"
 #include "husk-tl-jni.h"
 #include "husk-tl-ld.h"
@@ -119,11 +121,26 @@ static void install_crash_reporter(void)
 
 /* ------------------------------------------------------------------- launch */
 
-/* exit() from the game ends the game, and the thread that asked. */
+/*
+ * exit() from the game ends the game. The thread that asked goes back to the host code that called into the guest
+ * (tl_guest_unwind jumps to its landing pad, and does not return), and nothing calls into the guest after this.
+ *
+ * A thread with no pad cannot be given back to the host that way. A thread the guest started ends, as it would
+ * have on Android. The main thread must not: ending it would take Husk down, and parking it in a wait would freeze
+ * Husk's UI. Every way the host calls the guest from the main thread is under a pad, so this is for a call nobody
+ * has found yet: the main thread is handed to its run loop for good, nested above the abandoned guest frames, which
+ * keeps the UI alive (and says the game ended) while those frames and whatever host frames lie under them are never
+ * returned to -- including the UIKit event delivery that called in, which is why it is only a last resort.
+ */
 static void guest_exit(int status)
 {
     tl_log_line("native: the game exited (%d)", status);
     atomic_store(&A.state, HUSK_UNITY_ENDED);
+    tl_guest_unwind();
+    if (pthread_main_np()) {
+        tl_log_line("native: the game exited on the main thread outside any call the host made; the thread stays in its run loop");
+        for (;;) if (CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1e9, false) == kCFRunLoopRunFinished) usleep(10000);
+    }
     pthread_exit(NULL);
 }
 
@@ -157,6 +174,36 @@ static void *heartbeat_thread(void *arg)
     }
 }
 
+/* The engine's start-up, which runs the game's constructors and first natives: under the launch thread's landing pad. */
+static bool start_engine(void)
+{
+    if (A.engine == ENGINE_GAMEACTIVITY) {
+        tl_ga_config cfg = {
+            .apk_path = A.apk, .data_dir = A.data, .package_name = A.package, .width = A.width, .height = A.height,
+            .metal_layer = A.layer, .angle_egl = A.angle, .angle_gles = NULL, .frame_dir = NULL, .frame_every = 0,
+        };
+        tl_log_line("gameactivity: starting %s as %s, %dx%d", A.apk, A.package, A.width, A.height);
+        tl_audio_install();
+        return tl_ga_start(&cfg) && tl_ga_run();
+    }
+    if (A.engine == ENGINE_COCOS) {
+        tl_cocos_config cfg = {
+            .apk_path = A.apk, .data_dir = A.data, .package_name = A.package, .width = A.width, .height = A.height,
+            .metal_layer = A.layer, .angle_egl = A.angle, .angle_gles = NULL, .frame_dir = NULL, .frame_every = 0,
+        };
+        tl_log_line("cocos: starting %s as %s, %dx%d", A.apk, A.package, A.width, A.height);
+        tl_audio_install();
+        tl_cocos_text_install();
+        return tl_cocos_start(&cfg) && tl_cocos_run();
+    }
+    tl_unity_config cfg = {
+        .apk_path = A.apk, .data_dir = A.data, .package_name = A.package, .width = A.width, .height = A.height,
+        .metal_layer = A.layer, .angle_egl = A.angle, .angle_gles = NULL, .frame_dir = NULL, .frame_every = 0,
+    };
+    tl_log_line("unity: starting %s as %s, %dx%d", A.apk, A.package, A.width, A.height);
+    return tl_unity_start(&cfg) && tl_unity_run();
+}
+
 static void *launch_thread(void *arg)
 {
     (void)arg;
@@ -171,38 +218,20 @@ static void *launch_thread(void *arg)
     install_crash_reporter();
     tl_hle_set_ca_bundle(A.ca);
 
-    bool ok;
-    if (A.engine == ENGINE_GAMEACTIVITY) {
-        tl_ga_config cfg = {
-            .apk_path = A.apk, .data_dir = A.data, .package_name = A.package, .width = A.width, .height = A.height,
-            .metal_layer = A.layer, .angle_egl = A.angle, .angle_gles = NULL, .frame_dir = NULL, .frame_every = 0,
-        };
-        tl_log_line("gameactivity: starting %s as %s, %dx%d", A.apk, A.package, A.width, A.height);
-        tl_audio_install();
-        ok = tl_ga_start(&cfg) && tl_ga_run();
-    } else if (A.engine == ENGINE_COCOS) {
-        tl_cocos_config cfg = {
-            .apk_path = A.apk, .data_dir = A.data, .package_name = A.package, .width = A.width, .height = A.height,
-            .metal_layer = A.layer, .angle_egl = A.angle, .angle_gles = NULL, .frame_dir = NULL, .frame_every = 0,
-        };
-        tl_log_line("cocos: starting %s as %s, %dx%d", A.apk, A.package, A.width, A.height);
-        tl_audio_install();
-        tl_cocos_text_install();
-        ok = tl_cocos_start(&cfg) && tl_cocos_run();
-    } else {
-        tl_unity_config cfg = {
-            .apk_path = A.apk, .data_dir = A.data, .package_name = A.package, .width = A.width, .height = A.height,
-            .metal_layer = A.layer, .angle_egl = A.angle, .angle_gles = NULL, .frame_dir = NULL, .frame_every = 0,
-        };
-        tl_log_line("unity: starting %s as %s, %dx%d", A.apk, A.package, A.width, A.height);
-        ok = tl_unity_start(&cfg) && tl_unity_run();
+    bool ok = false;
+    TL_GUEST_CALL(ok = start_engine());
+    /* Only from STARTING: a game that exited while it started (here, or on a thread it had already started) has ENDED. */
+    int expected = HUSK_UNITY_STARTING;
+    if (tl_guest_ended()) {
+        tl_log_line("native: the game ended while it was starting");
+        return NULL;
     }
     if (!ok) {
         tl_log_line("native: the game could not be started");
-        atomic_store(&A.state, HUSK_UNITY_FAILED);
+        atomic_compare_exchange_strong(&A.state, &expected, HUSK_UNITY_FAILED);
         return NULL;
     }
-    atomic_store(&A.state, HUSK_UNITY_RUNNING);
+    if (!atomic_compare_exchange_strong(&A.state, &expected, HUSK_UNITY_RUNNING)) return NULL;
     pthread_t hb;
     if (pthread_create(&hb, NULL, heartbeat_thread, NULL) == 0) pthread_detach(hb);
     return NULL;

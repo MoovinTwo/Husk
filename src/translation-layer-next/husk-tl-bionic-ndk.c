@@ -5,6 +5,7 @@
  */
 #define _DARWIN_C_SOURCE
 #include "husk-tl-bionic.h"
+#include "husk-tl-guest.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -251,10 +252,12 @@ static void *aa_pump(void *arg)
     aa_stream *s = arg;
     pthread_setname_np("aaudio-pump");
     int16_t *buf = malloc((size_t)AA_BURST * AA_CHANNELS * sizeof(int16_t));
-    while (atomic_load(&s->run)) {
+    while (atomic_load(&s->run) && !tl_guest_ended()) {
         memset(buf, 0, (size_t)AA_BURST * AA_CHANNELS * sizeof(int16_t));
-        int r = s->cb(s, s->user, buf, AA_BURST);
-        if (!atomic_load(&s->run)) break;
+        /* The game's data callback, on a thread of ours: a game that exits inside it ends this loop, not the thread. */
+        int r = 1;                                                    /* AAUDIO_CALLBACK_RESULT_STOP, should it not return */
+        TL_GUEST_CALL(r = s->cb(s, s->user, buf, AA_BURST));
+        if (!atomic_load(&s->run) || tl_guest_ended()) break;
         { static bool said; if (!said) { for (int i = 0; i < AA_BURST * AA_CHANNELS; i++) if (buf[i]) { said = true; tl_log_line("aaudio: the game's first non-silent burst (sample %d = %d)", i, buf[i]); break; } } }
         if (tl_cocos_audio_hook) tl_cocos_audio_hook(buf, AA_BURST, AA_CHANNELS, AA_RATE);
         else { struct timespec ts = { 0, (long)((double)AA_BURST * 1e9 / AA_RATE) }; nanosleep(&ts, NULL); }
