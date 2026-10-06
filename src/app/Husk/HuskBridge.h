@@ -42,7 +42,8 @@ void     husk_display_request_update(void);
 /* --- Husk's JIT substrate --- */
 void husk_ios_jit_install_trap_handler(void);
 /* Claim the JIT region while StikDebug is still attached, before the guest
-   download. Pass the same size QEMU will ask for (tb-size). */
+   download. Pass JITBootstrap.jitBytes (HUSK_JIT_REGION_BYTES): QEMU carves
+   its tb-size buffer out of it and the translation layer uses the rest. */
 bool husk_ios_jit_prewarm(size_t bytes);
 bool husk_ios_jit_is_available(void);
 /* Whether a plain MAP_JIT mapping executes in this process -- the second of the

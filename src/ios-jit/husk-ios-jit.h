@@ -79,11 +79,23 @@ HUSK_EXPORT void husk_ios_jit_install_trap_handler(void);
 HuskDualMapping husk_ios_jit_allocate(size_t bytes);
 
 /*
+ * How much the JIT region is prewarmed with: the one size every caller of
+ * husk_ios_jit_prewarm() passes. Prewarm is one-shot, so whoever calls it first
+ * fixes the region's size for the session, and a smaller first call leaves
+ * QEMU's tb-size carve no room once anything else has taken a slice. Must
+ * match TL_JIT_REGION_BYTES in src/translation-layer/husk-tl-internal.h (which
+ * finds this library by dlsym and does not include this header) and
+ * JITBootstrap.jitBytes in src/app/Husk/JITBootstrap.swift.
+ */
+#define HUSK_JIT_REGION_BYTES ((size_t)512 * 1024 * 1024)
+
+/*
  * Claim the JIT region now, at app launch, and hold it until QEMU asks.
  * StikDebug does not stay attached forever, and a first run spends a minute
  * downloading the guest before QEMU starts -- by which time the debugger has
- * let go and no executable memory can be had at all. Pass the same size QEMU
- * will ask for (tb-size).
+ * let go and no executable memory can be had at all. Pass
+ * HUSK_JIT_REGION_BYTES: QEMU carves its tb-size buffer out of the region and
+ * the translation layer takes its slices from the rest.
  */
 HUSK_EXPORT bool husk_ios_jit_prewarm(size_t bytes);
 
