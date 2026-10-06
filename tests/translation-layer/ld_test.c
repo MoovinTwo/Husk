@@ -60,9 +60,16 @@ static size_t g_size, g_used;
 bool tl_xmem_open(size_t host_bytes, char *err, size_t errlen)
 {
     if (g_region) return true;
-    g_region = mmap(NULL, host_bytes, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    int extra = 0;
+#ifdef __APPLE__
+    extra = MAP_JIT;    /* Apple Silicon refuses a writable+executable mapping without it */
+#endif
+    g_region = mmap(NULL, host_bytes, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | extra, -1, 0);
     if (g_region == MAP_FAILED) { g_region = NULL; snprintf(err, errlen, "mmap: %s", strerror(errno)); return false; }
     g_size = host_bytes;
+#if defined(__APPLE__) && defined(__aarch64__)
+    pthread_jit_write_protect_np(0);   /* this thread writes the region; the tests run on it */
+#endif
     return true;
 }
 bool tl_xmem_alloc(size_t bytes, uint8_t **rx, uint8_t **rw)
@@ -86,13 +93,13 @@ long tl_linux_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long
 {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
     g_sys_calls++; g_sys_nr = nr; g_sys_a0 = a0;
-#if defined(__aarch64__)
+#if defined(__aarch64__) && !defined(__APPLE__) /* Mach-O C symbols already carry the underscore */
     /* Clobber x9 as any C function may: the stub's caller relies on it surviving, as it would a real system call. */
     __asm__ volatile("mov x9, #0" ::: "x9");
 #endif
     return nr * 1000 + a0;
 }
-#if defined(__aarch64__)
+#if defined(__aarch64__) && !defined(__APPLE__) /* Mach-O C symbols already carry the underscore */
 __asm__(".globl _tl_linux_syscall\n_tl_linux_syscall: b tl_linux_syscall\n"
         ".globl _tl_unresolved_called_c\n_tl_unresolved_called_c: b tl_unresolved_called_c\n");
 #endif
@@ -238,7 +245,7 @@ static void test_many_segments(void)
 
 /* ------------------------------------------------------------- far system calls */
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) && !defined(__APPLE__) /* Mach-O C symbols already carry the underscore */
 /*
  * An image whose code is `code_mib` long, all `udf` but for system-call sites: each a function
  *     mov x8, #nr; mov x9, #77; mov x0, #a0; svc #0; add x0, x0, x9; ret
@@ -299,7 +306,7 @@ int main(void)
     G.verbosity = 1;
     test_ifunc();
     test_many_segments();
-#if defined(__aarch64__)
+#if defined(__aarch64__) && !defined(__APPLE__) /* Mach-O C symbols already carry the underscore */
     test_far_svc();
 #else
     printf("skip far system calls: not arm64\n");

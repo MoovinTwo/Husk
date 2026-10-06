@@ -66,6 +66,19 @@ typedef struct tl_dual_mapping {
     size_t   size;
 } tl_dual_mapping;
 
+/* The size to prewarm the StikDebug region with when the translation layer gets
+ * there before the app has. Prewarm is one-shot, so this has to be the size the
+ * app would have used: a smaller region leaves no room for QEMU's tb-size carve
+ * once anything here has taken a slice. The app's setting (Settings > JIT,
+ * husk.jitRegionMiB) reaches this library as the HUSK_JIT_REGION_MIB
+ * environment variable, set by JITBootstrap; TL_JIT_REGION_BYTES is the default
+ * when it is unset or not an offered size (256 or 512). Use
+ * tl_jit_region_bytes(), not the macro. Must match HUSK_JIT_REGION_BYTES in
+ * src/ios-jit/husk-ios-jit.h (not included: that library is found by dlsym)
+ * and JITBootstrap.defaultJITRegionMiB in src/app/Husk/JITBootstrap.swift. */
+#define TL_JIT_REGION_BYTES ((size_t)512 * 1024 * 1024)
+size_t tl_jit_region_bytes(void);
+
 /* The whole StikDebug region, prewarming it first if nothing has yet; NULL when
  * there is none. Its bounds are for range checks: space in it is taken with
  * tl_jit_carve(), because QEMU and both loaders all draw from it. */

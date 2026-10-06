@@ -27,10 +27,14 @@ echo "== page planner"
 cc $CFLAGS -o "$OUT/plan_test" "$HERE/plan_test.c" "$SRC/husk-tl-elf.c"
 "$OUT/plan_test"
 
+# macOS builds the probe's __APPLE__ paths, which need the on-device JIT symbols.
+STUBS=
+[ "$(uname -s)" = Darwin ] && STUBS="$HERE/darwin_stubs.c"
+
 echo "== scanner"
 cc $CFLAGS -fsanitize=address,undefined -o "$OUT/scan_cli" "$HERE/scan_cli.c" \
     "$SRC"/husk-tl-json.c "$SRC"/husk-tl-zip.c "$SRC"/husk-tl-elf.c \
-    "$SRC"/husk-tl-scan.c "$SRC"/husk-tl-probe.c -lz -lpthread
+    "$SRC"/husk-tl-scan.c "$SRC"/husk-tl-probe.c $STUBS -lz -lpthread
 python3 "$HERE/test_scan.py" "$OUT" "$OUT/scan_cli"
 
 # The native runtime's linker and GL shim, included whole by their tests with the platform stubbed.
@@ -43,7 +47,7 @@ cc $CFLAGS -Wno-unused-function $SAN -I"$NEXT" -o "$OUT/ld_test" "$HERE/ld_test.
 "$OUT/ld_test"
 
 echo "== ES 3.1 shim binding tables"
-cc $CFLAGS -Wno-unused-function $SAN -I"$NEXT" -o "$OUT/es31_test" "$HERE/es31_test.c" -lpthread
+cc $CFLAGS -Wno-unused-function -Wno-deprecated-declarations $SAN -I"$NEXT" -o "$OUT/es31_test" "$HERE/es31_test.c" -lpthread
 "$OUT/es31_test"
 
 # The stubs the linker writes, run: far system-call sites. Needs clang and lld with
