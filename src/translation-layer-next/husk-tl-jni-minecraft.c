@@ -55,6 +55,18 @@ static void RetZero(tl_jcall *c) { c->ret = vi(0); }
 static void RetEmptyString(tl_jcall *c) { c->ret = vl(STR("")); }
 static void RetNull(tl_jcall *c) { c->ret = vl(NULL); }
 
+/*
+ * The licence questions are answered as an unlicensed device that has not heard from a licence server would answer
+ * them, because none was asked: nothing here claims a verified licence. The game may then fall back to trial mode or
+ * refuse to start; that is by design, and no workaround is provided.
+ *
+ * What checkLicense()I returns is not established: the protected MainActivity cannot be read, and nothing in this tree
+ * records its codes. It is assumed that 0 may mean success, as it does for most status codes, and that Google's
+ * licensing codes (LICENSED 0x100, NOT_LICENSED 0x231, RETRY 0x123) may be in play; so -1 is returned, which is none
+ * of those and reads as an error or "no response" under any of them.
+ */
+static void MA_checkLicense(tl_jcall *c) { c->ret = vi(-1); }
+
 /* -------------------------------------------------------------- preferences */
 
 /*
@@ -233,7 +245,7 @@ static void ui_call_run(void *arg)
     typedef void (*fn_t)(void *env, void *self, int64_t cb);
     fn_t fn = (fn_t)tl_jni_native("com/mojang/minecraftpe/MainActivity", "nativeRunNativeCallbackOnUiThread", "(J)V");
     if (!fn) { tl_lib *lib = tl_ld_find_lib("libminecraftpe.so"); fn = lib ? (fn_t)tl_ld_sym(lib, "Java_com_mojang_minecraftpe_MainActivity_nativeRunNativeCallbackOnUiThread") : NULL; }
-    if (fn) fn(tl_jni_env(), M.activity, u->cb);
+    if (fn) TL_JNI_NATIVE_CALL(fn(tl_jni_env(), M.activity, u->cb));
     pthread_mutex_lock(&u->mu); u->done = true; pthread_cond_signal(&u->cv); pthread_mutex_unlock(&u->mu);
 }
 static void MA_runNativeCallbackOnUiThread(tl_jcall *c)
@@ -252,7 +264,7 @@ static void MA_requestIntegrityToken(tl_jcall *c)
     typedef void (*fn_t)(void *env, void *self, void *msg);
     tl_lib *lib = tl_ld_find_lib("libminecraftpe.so");
     fn_t fn = lib ? (fn_t)tl_ld_sym(lib, "Java_com_mojang_minecraftpe_MainActivity_nativeSetIntegrityTokenErrorMessage") : NULL;
-    if (fn) fn(tl_jni_env(), M.activity, STR("Play Integrity is not available"));
+    if (fn) TL_JNI_NATIVE_CALL(fn(tl_jni_env(), M.activity, tl_jni_local(STR("Play Integrity is not available"))));
 }
 
 /* ------------------------------------------------- HardwareInformation etc. */
@@ -299,21 +311,22 @@ static void store_job_run(void *arg)
     void *env = tl_jni_env();
     if (j->what == 0) {
         void (*fn)(void *, void *, int64_t, uint8_t) = store_native("onStoreInitialized");
-        if (fn) fn(env, j->listener, ptr, 1);
+        if (fn) TL_JNI_NATIVE_CALL(fn(env, j->listener, ptr, 1));
     } else if (j->what == 1) {
         void (*fn)(void *, void *, int64_t, void *) = store_native("onQueryPurchasesSuccess");
-        if (fn) fn(env, j->listener, ptr, tl_jni_new_obj_array(C("com/mojang/minecraftpe/store/Purchase"), 0));
+        if (fn) TL_JNI_NATIVE_CALL(fn(env, j->listener, ptr, tl_jni_local(tl_jni_new_obj_array(C("com/mojang/minecraftpe/store/Purchase"), 0))));
     } else {
         void (*fn)(void *, void *, int64_t, void *) = store_native("onQueryProductsSuccess");
-        if (fn) fn(env, j->listener, ptr, tl_jni_new_obj_array(C("com/mojang/minecraftpe/store/Product"), 0));
+        if (fn) TL_JNI_NATIVE_CALL(fn(env, j->listener, ptr, tl_jni_local(tl_jni_new_obj_array(C("com/mojang/minecraftpe/store/Product"), 0))));
     }
+    tl_jni_unref(j->listener);
     free(j);
 }
 static void store_post(jobj *store, int what)
 {
     jobj *l = store ? tl_jni_get_field(store, "listener", "Ljava/lang/Object;").l : NULL;
     if (!l) return;
-    store_job *j = malloc(sizeof(*j)); j->listener = l; j->what = what;
+    store_job *j = malloc(sizeof(*j)); j->listener = tl_jni_ref(l); j->what = what;      /* the job outlives the call */
     tl_ga_post(store_job_run, j);
 }
 
@@ -342,7 +355,7 @@ static void XAL_randomBytes(tl_jcall *c)
     if (n > 0) arc4random_buf(a->arr.data, (size_t)n);
     c->ret = vl(a);
 }
-static void XAL_appContext(tl_jcall *c) { c->ret = vl(M.activity); }
+static void XAL_appContext(tl_jcall *c) { c->ret = vl(tl_jni_ref(M.activity)); }
 static void XAL_locale(tl_jcall *c) { c->ret = vl(STR("en-US")); }
 static void Playfab_uuid(tl_jcall *c) { char u[40]; new_uuid(u, true); c->ret = vl(STR(u)); }
 static void DateTime_is24(tl_jcall *c) { c->ret = vz(0); }
@@ -411,7 +424,9 @@ static const tl_jhle k_hle[] = {
     M_(MAIN, "getDisplayWidth", "()I", MA_displayWidth), M_(MAIN, "getDisplayHeight", "()I", MA_displayHeight),
     M_(MAIN, "getPlatformDpi", "()I", MA_platformDpi),
     M_(MAIN, "hasWriteExternalStoragePermission", "()Z", RetTrue),
-    M_(MAIN, "checkLicense", "()I", RetZero),
+    M_(MAIN, "checkLicense", "()I", MA_checkLicense),
+    /* isDemo asks which build this is (the separate trial APK or the full one), not whether it is licensed, and this
+     * is the full build; so it stays false and is not part of the licence answer. */
     M_(MAIN, "isDemo", "()Z", RetFalse),
     M_(MAIN, "getPlatformStringVar", "(I)Ljava/lang/String;", MA_platformStringVar),
     M_(MAIN, "getTimeFromProcessStart", "()J", MA_timeFromStart),
@@ -466,7 +481,11 @@ static const tl_jhle k_hle[] = {
     M_("com/mojang/minecraftpe/BrazeManager", "isBrazeSDKDisabled", "()Z", RetTrue), M_("com/mojang/minecraftpe/BrazeManager", "setBrazeID", "(Ljava/lang/String;)V", Noop),
 
     M_("com/mojang/minecraftpe/store/StoreFactory", "createGooglePlayStore", "(Ljava/lang/String;Lcom/mojang/minecraftpe/store/StoreListener;)Lcom/mojang/minecraftpe/store/Store;", Store_create),
-    M_(STORE, "hasVerifiedLicense", "()Z", RetTrue), M_(STORE, "receivedLicenseResponse", "()Z", RetTrue),
+    /* No licence server is ever asked, so no response has been received and nothing is verified. "false" for the
+     * response is what a real device that is offline reports; the game has to cope with that state without hanging,
+     * whereas "true but not verified" would claim a refusal that never came. getExtraLicenseData below answers an
+     * empty response whose times and retry count are zero, which claims nothing either. */
+    M_(STORE, "hasVerifiedLicense", "()Z", RetFalse), M_(STORE, "receivedLicenseResponse", "()Z", RetFalse),
     M_(STORE, "getStoreId", "()Ljava/lang/String;", Store_id), M_(STORE, "getProductSkuPrefix", "()Ljava/lang/String;", RetEmptyString),
     M_(STORE, "getRealmsSkuPrefix", "()Ljava/lang/String;", RetEmptyString),
     M_(STORE, "getExtraLicenseData", "()Lcom/mojang/minecraftpe/store/ExtraLicenseResponseData;", Store_extra),
@@ -523,7 +542,7 @@ void tl_mc_hle_install(const char *pkg, const char *apk, const char *data, int w
 void tl_mc_set_activity(jobj *activity)
 {
     M.activity = activity;
-    jvalue v; v.j = 0; v.l = activity;
+    jvalue v; v.j = 0; v.l = tl_jni_ref(activity);
     tl_jni_set_static("com/mojang/minecraftpe/MainActivity", "mInstance", "Lcom/mojang/minecraftpe/MainActivity;", v);
     tl_jni_set_static("com/mojang/minecraftpe/MainActivity", "mHasStoragePermission", "Z", vz(1));
 }

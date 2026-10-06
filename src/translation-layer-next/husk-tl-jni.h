@@ -46,6 +46,7 @@ struct jobj {
     };
     jvalue *fields;                     /* instance fields, indexed by tl_jfield::index */
     uint32_t nfields;
+    uint64_t refslots;                  /* which of fields[0..63] hold a reference of their own */
     void *native;                       /* an implementation's own state */
     void *monitor;
 };
@@ -55,7 +56,7 @@ typedef struct tl_jcall {
     jobj *self;                         /* NULL for a static method */
     tl_jclass *cls;                     /* the class the method was found on */
     const jvalue *args;
-    jvalue ret;                         /* written by the method */
+    jvalue ret;                         /* written by the method; an object is a new reference the caller owns */
 } tl_jcall;
 
 typedef void (*tl_jhle_fn)(tl_jcall *c);
@@ -90,7 +91,7 @@ jobj *tl_jni_new_obj_array(tl_jclass *elem, uint32_t len);
 jobj *tl_jni_ref(jobj *o);                                    /* a new reference to the same object */
 void  tl_jni_unref(jobj *o);
 
-/* Fields by name; created on first use. */
+/* Fields by name; created on first use. Setting an object field hands it the reference in `v` and releases the old one. */
 void tl_jni_set_field(jobj *o, const char *name, const char *sig, jvalue v);
 jvalue tl_jni_get_field(jobj *o, const char *name, const char *sig);
 void tl_jni_set_static(const char *cls, const char *name, const char *sig, jvalue v);
@@ -100,6 +101,20 @@ jvalue tl_jni_get_static(const char *cls, const char *name, const char *sig);
 void tl_jni_throw(const char *cls, const char *msg);
 bool tl_jni_pending(void);
 void tl_jni_clear(void);
+
+/* ------------------------------------------------------- local references */
+
+/*
+ * Objects the JNIEnv functions return are local references, released when the native method
+ * that received them returns, as on Android. TL_JNI_NATIVE_CALL runs a call into the guest's
+ * native code (a native method, JNI_OnLoad, a callback) in a local frame of its own; every place
+ * the host calls a native goes through it. tl_jni_local hands a reference to the innermost frame,
+ * for an object the host makes only to pass to such a call.
+ */
+void tl_jni_local_push(void);
+void tl_jni_local_pop(void);                                  /* releases every local recorded since the push */
+jobj *tl_jni_local(jobj *o);                                  /* the frame takes over this reference; returns o */
+#define TL_JNI_NATIVE_CALL(...) do { tl_jni_local_push(); __VA_ARGS__; tl_jni_local_pop(); } while (0)
 
 /* ---------------------------------------------------- what libraries register */
 
@@ -121,7 +136,7 @@ const char *tl_jni_reflected_sig(const jobj *member);        /* a method's or fi
 /* A Java proxy made by JNIBridge, whose methods run C# in the native library that registered JNIBridge.invoke. */
 
 
-/* Call a Java method by name from C (HLE-implemented or not), as native code would. */
+/* Call a Java method by name from C (HLE-implemented or not), as native code would. An object it returns is the caller's to release. */
 jvalue tl_jni_call(jobj *self_or_class, const char *name, const char *sig, const jvalue *args);
 
 #ifdef __cplusplus

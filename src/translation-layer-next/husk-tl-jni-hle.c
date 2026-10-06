@@ -119,6 +119,7 @@ static void String_hashCode(tl_jcall *c) { int h = 0; for (const unsigned char *
 
 /* --------------------------------------------------------------- Context */
 
+/* An object a method returns becomes the caller's: one kept here (H.*) goes out with a reference of its own. */
 static void Context_getPackageName(tl_jcall *c) { c->ret = vl(STR(H.pkg)); }
 static void Context_getPackageCodePath(tl_jcall *c) { c->ret = vl(STR(H.apk)); }
 static void Context_getPackageResourcePath(tl_jcall *c) { c->ret = vl(STR(H.apk)); }
@@ -129,13 +130,13 @@ static void Context_getNoBackupFilesDir(tl_jcall *c) { char p[700]; snprintf(p, 
 static void Context_getExternalFilesDir(tl_jcall *c) { c->ret = vl(new_file(H.ext_files)); }
 static void Context_getExternalCacheDir(tl_jcall *c) { c->ret = vl(new_file(H.ext_cache)); }
 static void Context_getDir(tl_jcall *c) { char p[700]; snprintf(p, sizeof(p), "%s/app_%s", H.data, S(c->args[0].l)); mkdirs(p); c->ret = vl(new_file(p)); }
-static void Context_getResources(tl_jcall *c) { c->ret = vl(H.resources); }
-static void Context_getAssets(tl_jcall *c) { c->ret = vl(H.assets); }
-static void Context_getApplicationInfo(tl_jcall *c) { c->ret = vl(H.appinfo); }
-static void Context_getPackageManager(tl_jcall *c) { c->ret = vl(H.pm); }
-static void Context_getApplicationContext(tl_jcall *c) { c->ret = vl(H.activity); }
+static void Context_getResources(tl_jcall *c) { c->ret = vl(tl_jni_ref(H.resources)); }
+static void Context_getAssets(tl_jcall *c) { c->ret = vl(tl_jni_ref(H.assets)); }
+static void Context_getApplicationInfo(tl_jcall *c) { c->ret = vl(tl_jni_ref(H.appinfo)); }
+static void Context_getPackageManager(tl_jcall *c) { c->ret = vl(tl_jni_ref(H.pm)); }
+static void Context_getApplicationContext(tl_jcall *c) { c->ret = vl(tl_jni_ref(H.activity)); }
 extern jobj *tl_loop_main_looper(void);
-static void Context_getMainLooper(tl_jcall *c) { c->ret = vl(tl_loop_main_looper()); }
+static void Context_getMainLooper(tl_jcall *c) { c->ret = vl(tl_jni_ref(tl_loop_main_looper())); }
 static void Context_getContentResolver(tl_jcall *c) { c->ret = vl(make("android/content/ContentResolver")); }
 static void Context_getClassLoader(tl_jcall *c) { c->ret = vl(make("dalvik/system/PathClassLoader")); }
 static void Context_getSharedPreferences(tl_jcall *c)
@@ -166,8 +167,8 @@ static void Context_getSystemService(tl_jcall *c)
         if (!strcmp(n, svc[i].name)) {
             static jobj *cache[32];
             if (!cache[i]) cache[i] = make(svc[i].cls);
-            if (!strcmp(n, "window")) { c->ret = vl(H.wm); return; }
-            c->ret = vl(cache[i]);
+            if (!strcmp(n, "window")) { c->ret = vl(tl_jni_ref(H.wm)); return; }
+            c->ret = vl(tl_jni_ref(cache[i]));
             return;
         }
     }
@@ -178,8 +179,8 @@ static void Context_getSystemService(tl_jcall *c)
 
 /* --------------------------------------------------------------- Activity */
 
-static void Activity_getWindow(tl_jcall *c) { c->ret = vl(H.window); }
-static void Activity_getWindowManager(tl_jcall *c) { c->ret = vl(H.wm); }
+static void Activity_getWindow(tl_jcall *c) { c->ret = vl(tl_jni_ref(H.window)); }
+static void Activity_getWindowManager(tl_jcall *c) { c->ret = vl(tl_jni_ref(H.wm)); }
 static void Activity_getRequestedOrientation(tl_jcall *c) { c->ret = vi(-1); }
 static void Activity_getIntent(tl_jcall *c) { c->ret = vl(make("android/content/Intent")); }
 static void Activity_isFinishing(tl_jcall *c) { c->ret = vz(0); }
@@ -187,9 +188,9 @@ static void Activity_getComponentName(tl_jcall *c) { c->ret = vl(make("android/c
 
 /* ---------------------------------------------------- Resources, metrics */
 
-static void Resources_getAssets(tl_jcall *c) { c->ret = vl(H.assets); }
-static void Resources_getConfiguration(tl_jcall *c) { c->ret = vl(H.config); }
-static void Resources_getDisplayMetrics(tl_jcall *c) { c->ret = vl(H.metrics); }
+static void Resources_getAssets(tl_jcall *c) { c->ret = vl(tl_jni_ref(H.assets)); }
+static void Resources_getConfiguration(tl_jcall *c) { c->ret = vl(tl_jni_ref(H.config)); }
+static void Resources_getDisplayMetrics(tl_jcall *c) { c->ret = vl(tl_jni_ref(H.metrics)); }
 static void Resources_getIdentifier(tl_jcall *c) { c->ret = vi(0); }
 
 static void fill_metrics(jobj *m)
@@ -206,11 +207,11 @@ static void Display_getDisplayId(tl_jcall *c) { c->ret = vi(0); }
 static void Display_getWidth(tl_jcall *c) { c->ret = vi(H.width); }
 static void Display_getHeight(tl_jcall *c) { c->ret = vi(H.height); }
 static void Display_getName(tl_jcall *c) { c->ret = vl(STR("Built-in Screen")); }
-static void WindowManager_getDefaultDisplay(tl_jcall *c) { c->ret = vl(H.display); }
+static void WindowManager_getDefaultDisplay(tl_jcall *c) { c->ret = vl(tl_jni_ref(H.display)); }
 
 /* ----------------------------------------------------- package information */
 
-static void PM_getApplicationInfo(tl_jcall *c) { c->ret = vl(H.appinfo); }
+static void PM_getApplicationInfo(tl_jcall *c) { c->ret = vl(tl_jni_ref(H.appinfo)); }
 static void PM_hasSystemFeature(tl_jcall *c)
 {
     const char *f = S(c->args[0].l);
@@ -281,7 +282,8 @@ static bool load_native_library(const char *base)
     if (first) {
         int32_t (*onload)(void *vm, void *reserved) = (int32_t (*)(void *, void *))tl_ld_sym(L, "JNI_OnLoad");
         if (onload) {
-            int32_t ver = onload(tl_jni_vm(), NULL);
+            int32_t ver;
+            TL_JNI_NATIVE_CALL(ver = onload(tl_jni_vm(), NULL));
             tl_log_line("jni: %s JNI_OnLoad -> %#x", base, ver);
         }
     }
@@ -381,7 +383,7 @@ static void Reflection_newProxyInstance(tl_jcall *c)
     tl_jni_set_field(p, "style", "I", vi(2));
     c->ret = vl(p);
 }
-static void Activity_getApplication(tl_jcall *c) { static jobj *app; if (!app) app = make("android/app/Application"); c->ret = vl(app); }
+static void Activity_getApplication(tl_jcall *c) { static jobj *app; if (!app) app = make("android/app/Application"); c->ret = vl(tl_jni_ref(app)); }
 static void Zero_int(tl_jcall *c) { c->ret = vi(0); }
 static void Unity_getNetworkConnectivity(tl_jcall *c) { c->ret = vi(2); }     /* ReachableViaLocalAreaNetwork: the phone has its network */
 
@@ -564,7 +566,7 @@ static void Context_getObbDirs(tl_jcall *c)
     c->ret = vl(a);
 }
 static void Activity_setRequestedOrientation(tl_jcall *c) { (void)c; }
-static void DM_getDisplay(tl_jcall *c) { c->ret = vl(H.display); }
+static void DM_getDisplay(tl_jcall *c) { c->ret = vl(tl_jni_ref(H.display)); }
 static void Noop(tl_jcall *c) { (void)c; }
 static void AudioManager_getDevices(tl_jcall *c) { c->ret = vl(tl_jni_new_obj_array(C("android/media/AudioDeviceInfo"), 0)); }
 static void AudioManager_getProperty(tl_jcall *c)
@@ -862,6 +864,6 @@ void tl_jni_hle_install(void)
     H.display = make("android/view/Display");
     H.wm = make("android/view/WindowManager");
     H.window = make("android/view/Window");
-    tl_jni_set_static("com/unity3d/player/UnityPlayer", "currentActivity", "Landroid/app/Activity;", vl(H.activity));
-    tl_jni_set_static("com/unity3d/player/UnityPlayer", "currentContext", "Landroid/content/Context;", vl(H.activity));
+    tl_jni_set_static("com/unity3d/player/UnityPlayer", "currentActivity", "Landroid/app/Activity;", vl(tl_jni_ref(H.activity)));
+    tl_jni_set_static("com/unity3d/player/UnityPlayer", "currentContext", "Landroid/content/Context;", vl(tl_jni_ref(H.activity)));
 }

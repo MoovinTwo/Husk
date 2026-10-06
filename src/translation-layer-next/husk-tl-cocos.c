@@ -97,7 +97,7 @@ bool tl_cocos_start(const tl_cocos_config *cfg)
                                        "Java_com_customRobTop_JniToCpp_setupHSSAssets");
     if (setup) {
         char ext[700]; snprintf(ext, sizeof(ext), "%s/sdcard", cfg->data_dir);
-        setup(tl_jni_env(), tl_jni_class_object("com/customRobTop/JniToCpp"), tl_jni_new_string(cfg->apk_path), tl_jni_new_string(ext));
+        TL_JNI_NATIVE_CALL(setup(tl_jni_env(), tl_jni_class_object("com/customRobTop/JniToCpp"), tl_jni_local(tl_jni_new_string(cfg->apk_path)), tl_jni_local(tl_jni_new_string(ext))));
         tl_log_line("cocos: setupHSSAssets done");
     }
     /* Cocos2dxHelper.init: nativeSetApkPath(applicationInfo.sourceDir). */
@@ -105,7 +105,7 @@ bool tl_cocos_start(const tl_cocos_config *cfg)
     str1_fn setapk = (str1_fn)native_of("org/cocos2dx/lib/Cocos2dxHelper", "nativeSetApkPath", "(Ljava/lang/String;)V",
                                         "Java_org_cocos2dx_lib_Cocos2dxHelper_nativeSetApkPath");
     if (!setapk) return false;
-    setapk(tl_jni_env(), tl_jni_class_object("org/cocos2dx/lib/Cocos2dxHelper"), tl_jni_new_string(cfg->apk_path));
+    TL_JNI_NATIVE_CALL(setapk(tl_jni_env(), tl_jni_class_object("org/cocos2dx/lib/Cocos2dxHelper"), tl_jni_local(tl_jni_new_string(cfg->apk_path))));
     tl_log_line("cocos: nativeSetApkPath done");
     return !tl_jni_pending();
 }
@@ -121,7 +121,7 @@ void tl_cocos_deliver_bitmap(int width, int height, const uint8_t *rgba)
     size_t n = (size_t)width * (size_t)height * 4;
     jobj *arr = tl_jni_new_prim_array('B', (uint32_t)n);
     memcpy(arr->arr.data, rgba, n);
-    fn(tl_jni_env(), tl_jni_class_object("org/cocos2dx/lib/Cocos2dxBitmap"), width, height, arr);
+    TL_JNI_NATIVE_CALL(fn(tl_jni_env(), tl_jni_class_object("org/cocos2dx/lib/Cocos2dxBitmap"), width, height, arr));
     tl_jni_unref(arr);
 }
 
@@ -130,7 +130,7 @@ void tl_cocos_resume_sound(void)
 {
     typedef void (*fn_t)(void *env, void *cls);
     fn_t fn = (fn_t)native_of("com/customRobTop/JniToCpp", "resumeSound", "()V", "Java_com_customRobTop_JniToCpp_resumeSound");
-    if (fn) fn(tl_jni_env(), tl_jni_class_object("com/customRobTop/JniToCpp"));
+    if (fn) TL_JNI_NATIVE_CALL(fn(tl_jni_env(), tl_jni_class_object("com/customRobTop/JniToCpp")));
 }
 
 /* -------------------------------------------------------------------- input */
@@ -200,28 +200,27 @@ static void drain_events(void)
         event *e = &ev[i];
         switch (e->kind) {
         case EV_TOUCH:
-            if (e->phase == 0 && begin) begin(env, cls, e->id, e->x, e->y);
-            else if (e->phase == 2 && end) end(env, cls, e->id, e->x, e->y);
+            if (e->phase == 0 && begin) TL_JNI_NATIVE_CALL(begin(env, cls, e->id, e->x, e->y));
+            else if (e->phase == 2 && end) TL_JNI_NATIVE_CALL(end(env, cls, e->id, e->x, e->y));
             else if (e->phase == 1 || e->phase == 3) {
                 many_fn fn = e->phase == 1 ? move : cancel;
                 if (!fn) break;
                 jobj *ids = tl_jni_new_prim_array('I', 1), *xs = tl_jni_new_prim_array('F', 1), *ys = tl_jni_new_prim_array('F', 1);
                 ((int *)ids->arr.data)[0] = e->id; ((float *)xs->arr.data)[0] = e->x; ((float *)ys->arr.data)[0] = e->y;
-                fn(env, cls, ids, xs, ys);
+                TL_JNI_NATIVE_CALL(fn(env, cls, ids, xs, ys));
                 tl_jni_unref(ids); tl_jni_unref(xs); tl_jni_unref(ys);
             }
             break;
         case EV_INSERT:
-            if (insert) { jobj *str = tl_jni_new_string(e->text); insert(env, cls, str); tl_jni_unref(str); }
+            if (insert) { jobj *str = tl_jni_new_string(e->text); TL_JNI_NATIVE_CALL(insert(env, cls, str)); tl_jni_unref(str); }
             free(e->text);
             break;
-        case EV_DELETE: if (del) del(env, cls); break;
-        case EV_KEY: if (keydown) keydown(env, cls, e->id); break;
+        case EV_DELETE: if (del) TL_JNI_NATIVE_CALL(del(env, cls)); break;
+        case EV_KEY: if (keydown) TL_JNI_NATIVE_CALL(keydown(env, cls, e->id)); break;
         case EV_CONTENT:
-            if (content) {
-                jobj *str = content(env, cls);
-                e->cb(str && tl_jni_string(str) ? tl_jni_string(str) : "");
-            } else e->cb("");
+            /* The string the native returns is a local of its call, so it is read before the call's frame goes. */
+            if (content) TL_JNI_NATIVE_CALL(jobj *str = content(env, cls); e->cb(str && tl_jni_string(str) ? tl_jni_string(str) : ""));
+            else e->cb("");
             break;
         }
         if (tl_jni_pending()) tl_jni_clear();
@@ -279,7 +278,7 @@ static void *gl_main(void *arg)
     life_fn on_resume = (life_fn)native_of(CLS_RENDERER, "nativeOnResume", "()V", "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeOnResume");
     if (!init || !render) { atomic_store(&U.ended, true); return NULL; }
     void *env = tl_jni_env(), *cls = tl_jni_class_object(CLS_RENDERER);
-    init(env, cls, U.cfg.width, U.cfg.height);
+    TL_JNI_NATIVE_CALL(init(env, cls, U.cfg.width, U.cfg.height));
     tl_log_line("cocos: nativeInit(%d, %d) done", U.cfg.width, U.cfg.height);
     if (tl_jni_pending()) { tl_log_line("cocos: an exception is pending after nativeInit"); tl_jni_clear(); }
 
@@ -287,20 +286,20 @@ static void *gl_main(void *arg)
     int64_t next = now_ns();
     while (!atomic_load(&U.stop)) {
         if (atomic_load(&U.paused)) {
-            if (!was_paused) { if (on_pause) on_pause(env, cls); was_paused = true; tl_log_line("cocos: paused"); }
+            if (!was_paused) { if (on_pause) TL_JNI_NATIVE_CALL(on_pause(env, cls)); was_paused = true; tl_log_line("cocos: paused"); }
             usleep(20000);
             next = now_ns();
             continue;
         }
         if (was_paused) {
-            if (on_resume) on_resume(env, cls);
+            if (on_resume) TL_JNI_NATIVE_CALL(on_resume(env, cls));
             /* The game's own resume does not bring its music back here; the activity's resumeSound does. */
             tl_cocos_resume_sound();
             was_paused = false; next = now_ns(); tl_log_line("cocos: resumed");
         }
         drain_events();
         int64_t t0 = now_ns();
-        render(env, cls);
+        TL_JNI_NATIVE_CALL(render(env, cls));
         swapBuffers(dpy, surf);
         int64_t t1 = now_ns();
         atomic_fetch_add(&U.perf_ns, (unsigned long long)(t1 - t0));

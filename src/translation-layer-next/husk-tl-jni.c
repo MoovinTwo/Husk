@@ -80,11 +80,97 @@ void tl_jni_unref(jobj *o)
     switch (o->kind) {
     case TL_K_STRING: free(o->str.utf8); break;
     case TL_K_PRIM_ARRAY: free(o->arr.data); break;
-    case TL_K_OBJ_ARRAY: free(o->oarr.v); break;
+    case TL_K_OBJ_ARRAY:
+        /* Each element holds a reference of its own (NewObjectArray, SetObjectArrayElement). */
+        for (uint32_t i = 0; i < o->oarr.len; i++) tl_jni_unref(o->oarr.v[i]);
+        free(o->oarr.v);
+        break;
     default: break;
     }
+    for (uint32_t i = 0; i < o->nfields && i < 64; i++) if (o->refslots >> i & 1) tl_jni_unref(o->fields[i].l);
     free(o->fields);
     free(o);
+}
+
+/* -------------------------------------------------------- local references */
+
+/*
+ * What a JNIEnv function hands native code is a local reference: on Android it lasts until the
+ * native method that received it returns, and most native code relies on that instead of calling
+ * DeleteLocalRef. So each thread keeps a stack of frames, each holding one reference for every
+ * local recorded in it, and popping a frame releases them. The drivers push one around each call
+ * into a native (TL_JNI_NATIVE_CALL) and PushLocalFrame pushes one for the guest. A thread that
+ * calls JNI outside both, such as one the game started and attached, gets a base frame that is
+ * released when it detaches; a thread that never detaches keeps its locals, as it does on Android.
+ * Frames belong to their thread, so none of this needs a lock.
+ */
+enum { LF_BASE, LF_HOST, LF_GUEST };
+typedef struct { jobj **v; uint32_t n, cap; uint8_t kind; } lframe;
+static __thread lframe *t_lf;                  /* slots stay allocated once used, for the next push */
+static __thread uint32_t t_nlf, t_caplf;
+
+static void lf_push(uint8_t kind, uint32_t cap)
+{
+    if (t_nlf == t_caplf) {
+        uint32_t n = t_caplf ? t_caplf * 2 : 8;
+        t_lf = realloc(t_lf, n * sizeof(*t_lf));
+        memset(t_lf + t_caplf, 0, (n - t_caplf) * sizeof(*t_lf));
+        t_caplf = n;
+    }
+    lframe *f = &t_lf[t_nlf++];
+    f->n = 0; f->kind = kind;
+    if (cap > 4096) cap = 4096;                /* a hint; the frame grows past it anyway */
+    if (f->cap < cap) { f->cap = cap; f->v = realloc(f->v, cap * sizeof(jobj *)); }
+}
+
+static void lf_pop(void)
+{
+    lframe *f = &t_lf[--t_nlf];
+    for (uint32_t i = 0; i < f->n; i++) tl_jni_unref(f->v[i]);
+    f->n = 0;
+}
+
+jobj *tl_jni_local(jobj *o)
+{
+    /* Class objects live as long as their class, so they are not worth a slot. */
+    if (!o || o->kind == TL_K_CLASS) return o;
+    if (!t_nlf) lf_push(LF_BASE, 0);
+    lframe *f = &t_lf[t_nlf - 1];
+    if (f->n == f->cap) { f->cap = f->cap ? f->cap * 2 : 32; f->v = realloc(f->v, f->cap * sizeof(jobj *)); }
+    f->v[f->n++] = o;
+    return o;
+}
+
+/* Take `o` out of the innermost frame that holds it, without releasing it. False when no frame does. */
+static bool local_forget(jobj *o)
+{
+    for (uint32_t k = t_nlf; k-- > 0;) {
+        lframe *f = &t_lf[k];
+        for (uint32_t i = f->n; i-- > 0;) if (f->v[i] == o) { f->v[i] = f->v[--f->n]; return true; }
+    }
+    return false;
+}
+
+void tl_jni_local_push(void) { lf_push(LF_HOST, 0); }
+
+void tl_jni_local_pop(void)
+{
+    /* Down to the innermost frame a driver pushed: frames the guest pushed inside the call and never
+     * popped go with it, as they do when an ART native method returns. */
+    uint32_t k = t_nlf;
+    while (k && t_lf[k - 1].kind != LF_HOST) k--;
+    if (!k) return;
+    while (t_nlf >= k) lf_pop();
+}
+
+/* DetachCurrentThread: the thread's locals go. Not while a native call on it is still running, which ART refuses. */
+static void locals_detach(void)
+{
+    for (uint32_t k = 0; k < t_nlf; k++) if (t_lf[k].kind == LF_HOST) return;
+    while (t_nlf) lf_pop();
+    for (uint32_t k = 0; k < t_caplf; k++) free(t_lf[k].v);
+    free(t_lf);
+    t_lf = NULL; t_caplf = 0;
 }
 
 static tl_jclass *find_class_locked(const char *name)
@@ -328,10 +414,32 @@ static jvalue *field_slot(jobj *o, tl_jfield *f)
     return &o->fields[f->index];
 }
 
+/*
+ * An object field owns its value: it takes the reference it is given (`is_obj`) and releases the one it
+ * held. Two classes of one object number their fields independently, so a slot can be an object field
+ * through one and a number through the other; an instance slot is therefore released only when it is
+ * marked as holding a reference, which also lets the object release its fields when it goes. A slot past
+ * the 64 the mark covers keeps what it is given.
+ */
+static void store_value(jobj *o, tl_jfield *f, bool is_obj, jvalue v)
+{
+    jvalue *slot = field_slot(o, f);
+    jobj *old = NULL;
+    if (f->is_static) old = is_obj ? slot->l : NULL;
+    else if (f->index < 64) {
+        uint64_t bit = 1ull << f->index;
+        if (o->refslots & bit) old = slot->l;
+        o->refslots = is_obj ? o->refslots | bit : o->refslots & ~bit;
+    }
+    *slot = v;
+    tl_jni_unref(old);
+}
+static bool sig_is_obj(const char *sig) { return sig[0] == 'L' || sig[0] == '['; }
+
 void tl_jni_set_field(jobj *o, const char *name, const char *sig, jvalue v)
 {
     tl_jfield *f = lookup_field(o->cls, name, sig, false, true);
-    *field_slot(o, f) = v;
+    store_value(o, f, sig_is_obj(sig), v);
 }
 jvalue tl_jni_get_field(jobj *o, const char *name, const char *sig)
 {
@@ -342,7 +450,7 @@ void tl_jni_set_static(const char *cls, const char *name, const char *sig, jvalu
 {
     tl_jclass *c = tl_jni_class(cls);
     tl_jfield *f = lookup_field(c, name, sig, true, true);
-    *field_slot(NULL, f) = v;
+    store_value(NULL, f, sig_is_obj(sig), v);
 }
 jvalue tl_jni_get_static(const char *cls, const char *name, const char *sig)
 {
@@ -353,18 +461,20 @@ jvalue tl_jni_get_static(const char *cls, const char *name, const char *sig)
 
 /* ------------------------------------------------------------- exceptions */
 
-static __thread jobj *t_pending;
+static __thread jobj *t_pending;               /* holds a reference of its own */
+
+static void set_pending(jobj *e) { jobj *old = t_pending; t_pending = e; tl_jni_unref(old); }
 
 void tl_jni_throw(const char *cls, const char *msg)
 {
     jobj *e = tl_jni_new_object(tl_jni_class(cls));
     jvalue v; v.l = tl_jni_new_string(msg ? msg : "");
     tl_jni_set_field(e, "detailMessage", "Ljava/lang/String;", v);
-    t_pending = e;
+    set_pending(e);
     tl_log_line("jni: throwing %s: %s", cls, msg ? msg : "");
 }
 bool tl_jni_pending(void) { return t_pending != NULL; }
-void tl_jni_clear(void) { t_pending = NULL; }
+void tl_jni_clear(void) { set_pending(NULL); }
 
 /* --------------------------------------------------------------- calling */
 
@@ -384,11 +494,10 @@ static jvalue invoke(jobj *self, tl_jmeth *m, bool nonvirtual, const jvalue *arg
     }
     if (fn) {
         if (g_trace >= 2) tl_log_line("jni: call %s.%s%s", m->cls->name, m->name, m->sig);
+        /* An implementation returns an object as a new reference that its caller owns: one it made, or
+         * a reference it took on one it keeps (the Activity, the Display). The JNI entry points record
+         * it as a local; tl_jni_call hands it to the host. */
         fn(&c);
-        /* A method that returns an object hands the caller a new local reference. The implementations
-         * return objects they keep (the Activity, the Display), so without this a caller releasing its
-         * reference would free an object that is still in use. */
-        if (m->retk == 'L' && c.ret.l && ((jobj *)c.ret.l)->kind != TL_K_CLASS) tl_jni_ref(c.ret.l);
         return c.ret;
     }
     if (!m->warned) {
@@ -426,12 +535,17 @@ static jvalue null_receiver(const tl_jmeth *m)
     tl_jni_throw("java/lang/NullPointerException", msg);
     return g_zero;
 }
+static jvalue as_local(const tl_jmeth *m, jvalue r)
+{
+    if (m->retk == 'L') tl_jni_local(r.l);
+    return r;
+}
 static jvalue call_a(int kind, jobj *self, void *mid, const jvalue *args)
 {
     tl_jmeth *m = mid_ok(mid);
     if (!m) return g_zero;
     if (kind != 2 && !self) return null_receiver(m);
-    return invoke(kind == 2 ? NULL : self, m, kind == 1, args);
+    return as_local(m, invoke(kind == 2 ? NULL : self, m, kind == 1, args));
 }
 static jvalue call_va(int kind, jobj *self, void *mid, tl_va_list *ap)
 {
@@ -440,7 +554,7 @@ static jvalue call_va(int kind, jobj *self, void *mid, tl_va_list *ap)
     if (kind != 2 && !self) return null_receiver(m);
     jvalue args[40];
     args_from_va(m, ap, args);
-    return invoke(kind == 2 ? NULL : self, m, kind == 1, args);
+    return as_local(m, invoke(kind == 2 ? NULL : self, m, kind == 1, args));
 }
 
 jvalue tl_jni_call(jobj *self_or_class, const char *name, const char *sig, const jvalue *args)
@@ -493,9 +607,9 @@ static uint8_t jni_IsInstanceOf(void *env, jo obj, jo cls)
     return assignable(obj->cls, cls->klass.jc);
 }
 
-static int32_t jni_Throw(void *env, jo t) { (void)env; t_pending = t; return 0; }
+static int32_t jni_Throw(void *env, jo t) { (void)env; set_pending(tl_jni_ref(t)); return 0; }
 static int32_t jni_ThrowNew(void *env, jo cls, const char *msg) { (void)env; tl_jni_throw(cls && cls->kind == TL_K_CLASS ? cls->klass.jc->name : "java/lang/Error", msg); return 0; }
-static jo jni_ExceptionOccurred(void *env) { (void)env; return tl_jni_ref(t_pending); }
+static jo jni_ExceptionOccurred(void *env) { (void)env; return tl_jni_local(tl_jni_ref(t_pending)); }
 static void jni_ExceptionDescribe(void *env)
 {
     (void)env;
@@ -503,18 +617,35 @@ static void jni_ExceptionDescribe(void *env)
     jvalue m = tl_jni_get_field(t_pending, "detailMessage", "Ljava/lang/String;");
     tl_log_line("jni: pending exception %s: %s", t_pending->cls->name, tl_jni_string(m.l) ? tl_jni_string(m.l) : "");
 }
-static void jni_ExceptionClear(void *env) { (void)env; t_pending = NULL; }
+static void jni_ExceptionClear(void *env) { (void)env; tl_jni_clear(); }
 static void jni_FatalError(void *env, const char *msg) { (void)env; tl_log_line("jni: FatalError: %s", msg); abort(); }
-static int32_t jni_PushLocalFrame(void *env, int32_t cap) { (void)env; (void)cap; return 0; }
-static jo jni_PopLocalFrame(void *env, jo r) { (void)env; return r; }
+static int32_t jni_PushLocalFrame(void *env, int32_t cap) { (void)env; lf_push(LF_GUEST, cap > 0 ? (uint32_t)cap : 0); return 0; }
+static jo jni_PopLocalFrame(void *env, jo r)
+{
+    (void)env;
+    /* A pop with no frame of the guest's to match it would release the locals of the call it is in. */
+    if (!t_nlf || t_lf[t_nlf - 1].kind != LF_GUEST) { TRACE("jni: PopLocalFrame without a PushLocalFrame; ignored"); return r; }
+    tl_jni_ref(r);                              /* the result outlives its frame, as a local of the one outside */
+    lf_pop();
+    return tl_jni_local(r);
+}
 static jo jni_NewGlobalRef(void *env, jo o) { (void)env; return tl_jni_ref(o); }
 static void jni_DeleteGlobalRef(void *env, jo o) { (void)env; tl_jni_unref(o); }
-static void jni_DeleteLocalRef(void *env, jo o) { (void)env; tl_jni_unref(o); }
+static void jni_DeleteLocalRef(void *env, jo o)
+{
+    (void)env;
+    if (!o || o->kind == TL_K_CLASS) return;
+    if (local_forget(o)) { tl_jni_unref(o); return; }
+    /* Not a local of this thread: a global, or something the host passed in that it still owns. Releasing it
+     * here would free an object that is still referenced, so it is left alone. */
+    static bool told;
+    if (g_trace >= 1 && !told) { told = true; tl_log_line("jni: DeleteLocalRef of a %s that is not a local here; ignored", tl_jni_class_name(o)); }
+}
 static uint8_t jni_IsSameObject(void *env, jo a, jo b) { (void)env; return a == b; }
-static jo jni_NewLocalRef(void *env, jo o) { (void)env; return tl_jni_ref(o); }
+static jo jni_NewLocalRef(void *env, jo o) { (void)env; return tl_jni_local(tl_jni_ref(o)); }
 static int32_t jni_EnsureLocalCapacity(void *env, int32_t n) { (void)env; (void)n; return 0; }
 static uint32_t jni_GetObjectRefType(void *env, jo o) { (void)env; (void)o; return 1; }
-static jo jni_AllocObject(void *env, jo cls) { (void)env; return (cls && cls->kind == TL_K_CLASS) ? tl_jni_new_object(cls->klass.jc) : NULL; }
+static jo jni_AllocObject(void *env, jo cls) { (void)env; return (cls && cls->kind == TL_K_CLASS) ? tl_jni_local(tl_jni_new_object(cls->klass.jc)) : NULL; }
 static jo jni_GetObjectClass(void *env, jo o)
 {
     (void)env;
@@ -594,10 +725,10 @@ static jo new_object(jo cls, void *mid, int how, const jvalue *a, tl_va_list *ap
         const jvalue *use = how == 1 ? args : a;
         jvalue r = invoke(o, m, true, use);
         /* A constructor can stand in for the object it was given: String is not an ordinary object. */
-        if (r.l && ((jobj *)r.l)->kind != TL_K_OBJECT) { tl_jni_unref(o); return r.l; }
-        if (r.l && r.l != o) { tl_jni_unref(o); return r.l; }
+        if (r.l && r.l != o) { tl_jni_unref(o); return tl_jni_local(r.l); }
+        if (r.l == o) tl_jni_unref(o);          /* the reference it returned to its own receiver */
     }
-    return o;
+    return tl_jni_local(o);
 }
 static jo jni_NewObjectA(void *env, jo cls, void *mid, const jvalue *a) { (void)env; return new_object(cls, mid, 2, a, NULL); }
 static jo jni_NewObjectV(void *env, jo cls, void *mid, tl_va_list *ap) { (void)env; return new_object(cls, mid, 1, NULL, ap); }
@@ -700,15 +831,16 @@ static jo jni_ToReflectedMethod(void *env, jo cls, void *mid, uint8_t is_static)
 {
     (void)env; (void)cls; (void)is_static;
     tl_jmeth *m = mid;
-    return m ? reflected(!strcmp(m->name, "<init>") ? "java/lang/reflect/Constructor" : "java/lang/reflect/Method", m) : NULL;
+    return m ? tl_jni_local(reflected(!strcmp(m->name, "<init>") ? "java/lang/reflect/Constructor" : "java/lang/reflect/Method", m)) : NULL;
 }
 static jo jni_ToReflectedField(void *env, jo cls, void *fid, uint8_t is_static)
 {
     (void)env; (void)cls; (void)is_static;
-    return fid ? reflected("java/lang/reflect/Field", fid) : NULL;
+    return fid ? tl_jni_local(reflected("java/lang/reflect/Field", fid)) : NULL;
 }
 
-#define REF_Object(x) ((jo)tl_jni_ref((jo)(x)))
+/* Reading an object field gives native code a local of its own; writing any field goes through store_value. */
+#define REF_Object(x) ((jo)tl_jni_local(tl_jni_ref((jo)(x))))
 #define REF_Boolean(x) (x)
 #define REF_Byte(x) (x)
 #define REF_Char(x) (x)
@@ -717,11 +849,21 @@ static jo jni_ToReflectedField(void *env, jo cls, void *fid, uint8_t is_static)
 #define REF_Long(x) (x)
 #define REF_Float(x) (x)
 #define REF_Double(x) (x)
+#define PUT_Object(o, fid, F, v) do { jvalue n_; n_.j = 0; n_.l = tl_jni_ref(v); store_value((o), (fid), true, n_); } while (0)
+#define PUT_PRIM(o, fid, F, v) do { jvalue n_; n_.j = 0; n_.F = (v); store_value((o), (fid), false, n_); } while (0)
+#define PUT_Boolean PUT_PRIM
+#define PUT_Byte PUT_PRIM
+#define PUT_Char PUT_PRIM
+#define PUT_Short PUT_PRIM
+#define PUT_Int PUT_PRIM
+#define PUT_Long PUT_PRIM
+#define PUT_Float PUT_PRIM
+#define PUT_Double PUT_PRIM
 #define GEN_FIELDS(T, CT, F) \
     static CT jni_Get##T##Field(void *env, jo o, void *fid) { (void)env; return (CT)REF_##T(field_slot(o, fid)->F); } \
-    static void jni_Set##T##Field(void *env, jo o, void *fid, CT v) { (void)env; field_slot(o, fid)->F = v; } \
+    static void jni_Set##T##Field(void *env, jo o, void *fid, CT v) { (void)env; PUT_##T(o, fid, F, v); } \
     static CT jni_GetStatic##T##Field(void *env, jo c, void *fid) { (void)env; (void)c; return (CT)REF_##T(field_slot(NULL, fid)->F); } \
-    static void jni_SetStatic##T##Field(void *env, jo c, void *fid, CT v) { (void)env; (void)c; field_slot(NULL, fid)->F = v; }
+    static void jni_SetStatic##T##Field(void *env, jo c, void *fid, CT v) { (void)env; (void)c; PUT_##T(NULL, fid, F, v); }
 JV_TYPES(GEN_FIELDS)
 
 /* --- strings --- */
@@ -767,11 +909,11 @@ static char *from_utf16(const uint16_t *u, size_t n)
     return out;
 }
 
-static jo jni_NewString(void *env, const uint16_t *chars, int32_t len) { (void)env; char *s = from_utf16(chars, (size_t)len); jo o = tl_jni_new_string(s); free(s); return o; }
+static jo jni_NewString(void *env, const uint16_t *chars, int32_t len) { (void)env; char *s = from_utf16(chars, (size_t)len); jo o = tl_jni_new_string(s); free(s); return tl_jni_local(o); }
 static int32_t jni_GetStringLength(void *env, jo s) { (void)env; return (int32_t)utf16_len(tl_jni_string(s) ? tl_jni_string(s) : ""); }
 static const uint16_t *jni_GetStringChars(void *env, jo s, uint8_t *copy) { (void)env; if (copy) *copy = 1; return to_utf16(tl_jni_string(s) ? tl_jni_string(s) : "", NULL); }
 static void jni_ReleaseStringChars(void *env, jo s, const uint16_t *c) { (void)env; (void)s; free((void *)c); }
-static jo jni_NewStringUTF(void *env, const char *utf) { (void)env; return utf ? tl_jni_new_string(utf) : NULL; }
+static jo jni_NewStringUTF(void *env, const char *utf) { (void)env; return utf ? tl_jni_local(tl_jni_new_string(utf)) : NULL; }
 static int32_t jni_GetStringUTFLength(void *env, jo s) { (void)env; return (int32_t)strlen(tl_jni_string(s) ? tl_jni_string(s) : ""); }
 static const char *jni_GetStringUTFChars(void *env, jo s, uint8_t *copy) { (void)env; if (copy) *copy = 1; return strdup(tl_jni_string(s) ? tl_jni_string(s) : ""); }
 static void jni_ReleaseStringUTFChars(void *env, jo s, const char *c) { (void)env; (void)s; free((void *)c); }
@@ -798,9 +940,9 @@ static jo jni_NewObjectArray(void *env, int32_t len, jo cls, jo init)
     (void)env;
     jo a = tl_jni_new_obj_array(cls ? cls->klass.jc : NULL, (uint32_t)len);
     for (int32_t i = 0; init && i < len; i++) a->oarr.v[i] = tl_jni_ref(init);
-    return a;
+    return tl_jni_local(a);
 }
-static jo jni_GetObjectArrayElement(void *env, jo a, int32_t i) { (void)env; return (a && i >= 0 && (uint32_t)i < a->oarr.len) ? tl_jni_ref(a->oarr.v[i]) : NULL; }
+static jo jni_GetObjectArrayElement(void *env, jo a, int32_t i) { (void)env; return (a && i >= 0 && (uint32_t)i < a->oarr.len) ? tl_jni_local(tl_jni_ref(a->oarr.v[i])) : NULL; }
 static void jni_SetObjectArrayElement(void *env, jo a, int32_t i, jo v)
 {
     (void)env;
@@ -814,7 +956,7 @@ static void jni_SetObjectArrayElement(void *env, jo a, int32_t i, jo v)
     X(Int, int32_t, 'I') X(Long, int64_t, 'J') X(Float, float, 'F') X(Double, double, 'D')
 
 #define GEN_ARRAYS(T, CT, K) \
-    static jo jni_New##T##Array(void *env, int32_t len) { (void)env; return tl_jni_new_prim_array(K, (uint32_t)len); } \
+    static jo jni_New##T##Array(void *env, int32_t len) { (void)env; return tl_jni_local(tl_jni_new_prim_array(K, (uint32_t)len)); } \
     static CT *jni_Get##T##ArrayElements(void *env, jo a, uint8_t *copy) { (void)env; if (copy) *copy = 0; return a ? a->arr.data : NULL; } \
     static void jni_Release##T##ArrayElements(void *env, jo a, CT *e, int32_t mode) { (void)env; (void)a; (void)e; (void)mode; } \
     static void jni_Get##T##ArrayRegion(void *env, jo a, int32_t s, int32_t n, CT *buf) { (void)env; \
@@ -871,7 +1013,7 @@ static jo jni_NewDirectByteBuffer(void *env, void *addr, int64_t cap)
     jvalue a, c; a.l = addr; c.j = cap;
     tl_jni_set_field(o, "address", "J", a);
     tl_jni_set_field(o, "capacity", "J", c);
-    return o;
+    return tl_jni_local(o);
 }
 static void *jni_GetDirectBufferAddress(void *env, jo o) { (void)env; return o ? tl_jni_get_field(o, "address", "J").l : NULL; }
 static int64_t jni_GetDirectBufferCapacity(void *env, jo o) { (void)env; return o ? tl_jni_get_field(o, "capacity", "J").j : -1; }
@@ -884,7 +1026,7 @@ static const void *g_env_fns[233];
 
 static int32_t vm_DestroyJavaVM(void *vm) { (void)vm; return 0; }
 static int32_t vm_Attach(void *vm, void **penv, void *args) { (void)vm; (void)args; *penv = &g_env; return 0; }
-static int32_t vm_Detach(void *vm) { (void)vm; return 0; }
+static int32_t vm_Detach(void *vm) { (void)vm; locals_detach(); return 0; }
 static int32_t vm_GetEnv(void *vm, void **penv, int32_t version) { (void)vm; (void)version; *penv = &g_env; return 0; }
 static const void *g_vm_fns[8] = { NULL, NULL, NULL, vm_DestroyJavaVM, vm_Attach, vm_Detach, vm_GetEnv, vm_Attach };
 static int32_t jni_GetJavaVM(void *env, void **vm) { (void)env; *vm = &g_vm; return 0; }

@@ -247,24 +247,49 @@ static void describe_caller(void *lr, char *out, size_t n)
     else snprintf(out, n, "%p", lr);
 }
 
+/* When set, a guest exit() ends the guest, not the app that is hosting it. The hook does not return. */
+void (*tl_guest_exit_hook)(int status);
+
+/*
+ * The guest ending itself the hard way: abort(), _exit(), or SIGABRT or SIGKILL raised on its own process. On Android
+ * that ends the game's process; here the game shares a process with the app, so it ends the guest instead, as exit()
+ * does, with the status a shell would report (128 plus the signal for a signal). Without a hook this returns, and the
+ * caller ends the process as it always did.
+ */
+void tl_guest_fatal(int status, const char *what, void *lr)
+{
+    char where[200];
+    describe_caller(lr, where, sizeof(where));
+    tl_log_line("bionic: %s called from %s", what, where);
+    if (tl_guest_exit_hook) tl_guest_exit_hook(status);
+}
+
 static void guest_abort(const char *why)
 {
     char where[200];
     describe_caller(__builtin_return_address(0), where, sizeof(where));
     tl_log_line("bionic: guest abort (%s) at %s", why, where);
+    if (tl_guest_exit_hook) tl_guest_exit_hook(128 + 6);
     abort();
 }
 
+/*
+ * Android's abort() runs a SIGABRT handler the guest installed before the process dies. That handler is recorded but
+ * never installed (husk-tl-bionic-io.c keeps fault signals, SIGABRT among them, with the host), and it is not run here
+ * either: it is nearly always a crash reporter, which would be handed a Darwin context it reads as Linux, and which
+ * ends by re-raising SIGABRT anyway. The log line names the caller instead.
+ */
 static void bionic_abort(void)
 {
-    char where[200];
-    describe_caller(__builtin_return_address(0), where, sizeof(where));
-    tl_log_line("bionic: abort() called from %s", where);
+    tl_guest_fatal(128 + 6, "abort()", __builtin_return_address(0));
     abort();
 }
 
-/* When set, a guest exit() ends the guest, not the app that is hosting it. The hook does not return. */
-void (*tl_guest_exit_hook)(int status);
+static void bionic__exit(int status)
+{
+    tl_guest_fatal(status, "_exit()", __builtin_return_address(0));
+    _exit(status);
+}
 
 static void bionic_exit(int status)
 {
@@ -282,6 +307,7 @@ static void bionic___assert2(const char *file, int line, const char *func, const
     char where[200];
     describe_caller(__builtin_return_address(0), where, sizeof(where));
     tl_log_line("bionic: assertion failed: %s:%d: %s: %s (from %s)", file, line, func ? func : "?", expr, where);
+    if (tl_guest_exit_hook) tl_guest_exit_hook(128 + 6);
     abort();
 }
 
@@ -336,18 +362,30 @@ static void bionic___cxa_finalize(void *dso)
 
 /* -------------------------------------------------------- system queries */
 
-static unsigned long bionic_getauxval(unsigned long type)
+/* The auxiliary vector, in one place: getauxval answers from it, and so do the hardware capabilities the loader hands
+ * IFUNC resolvers (husk-tl-ld.c), so a resolver and the code it picks cannot disagree about the CPU. False for a type
+ * this vector does not have. */
+static bool auxval(unsigned long type, unsigned long *v)
 {
     static uint8_t random16[16] = { 0x4a, 0x13, 0x9c, 0x71, 0xe2, 0x05, 0x88, 0x3d, 0xb6, 0x21, 0x5f, 0xc4, 0x90, 0x2e, 0x67, 0xd8 };
     switch (type) {
-    case 6:  return 16384;                                   /* AT_PAGESZ */
-    case 16: return 0xff;                                    /* AT_HWCAP: FP, ASIMD, EVTSTRM, AES, PMULL, SHA1, SHA2, CRC32 */
-    case 26: return 0;                                       /* AT_HWCAP2 */
-    case 25: return (unsigned long)random16;                 /* AT_RANDOM */
-    case 17: return 100;                                     /* AT_CLKTCK */
-    case 23: return 0;                                       /* AT_SECURE */
-    default: errno = 0; tl_set_guest_errno(2); return 0;
+    case 6:  *v = 16384; return true;                        /* AT_PAGESZ */
+    case 16: *v = 0xff; return true;                         /* AT_HWCAP: FP, ASIMD, EVTSTRM, AES, PMULL, SHA1, SHA2, CRC32 */
+    case 26: *v = 0; return true;                            /* AT_HWCAP2 */
+    case 25: *v = (unsigned long)random16; return true;      /* AT_RANDOM */
+    case 17: *v = 100; return true;                          /* AT_CLKTCK */
+    case 23: *v = 0; return true;                            /* AT_SECURE */
+    default: *v = 0; return false;
     }
+}
+
+unsigned long tl_bionic_auxval(unsigned long type) { unsigned long v; auxval(type, &v); return v; }
+
+static unsigned long bionic_getauxval(unsigned long type)
+{
+    unsigned long v;
+    if (!auxval(type, &v)) { errno = 0; tl_set_guest_errno(2); }
+    return v;
 }
 
 static int bionic_getpagesize(void) { return 16384; }
@@ -566,7 +604,8 @@ const tl_bionic_entry tl_tab_core[] = {
     TL_WRAP("closelog", bionic_closelog),
     TL_WRAP("abort", bionic_abort),
     TL_WRAP("exit", bionic_exit),
-    TL_DIRECT(_exit),
+    TL_WRAP("_exit", bionic__exit),
+    TL_WRAP("_Exit", bionic__exit),
     TL_WRAP("__stack_chk_fail", bionic___stack_chk_fail),
     TL_WRAP("__assert2", bionic___assert2),
     TL_WRAP("android_set_abort_message", bionic_android_set_abort_message),

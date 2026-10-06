@@ -51,9 +51,13 @@ extern const tl_bionic_entry tl_tab_cxx[];
 void *tl_egl_resolve(const char *name);   /* husk-tl-egl.c: GLES by name, through ANGLE */
 
 extern void (*tl_guest_exit_hook)(int status);   /* set by an app host: exit() from guest code calls it instead of exiting */
+/* abort(), _exit() or a fatal signal on itself from guest code: logs the caller (lr), then calls tl_guest_exit_hook
+ * with status if one is set. Returns only when none is, and the caller then ends the process. */
+void tl_guest_fatal(int status, const char *what, void *lr);
 
 void *tl_bionic_find(const char *name);
 bool  tl_bionic_is_system_lib(const char *soname);
+unsigned long tl_bionic_auxval(unsigned long type);   /* what the guest's getauxval(type) answers; 0 when it has none */
 
 /* ----------------------------------------------------------------- errno */
 

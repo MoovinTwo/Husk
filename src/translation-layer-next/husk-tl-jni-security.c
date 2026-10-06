@@ -119,7 +119,7 @@ static void KeyFactory_generatePublic(tl_jcall *c)
 {
     jobj *spec = c->args[0].l;
     jobj *k = tl_jni_new_object(tl_jni_class("java/security/PublicKey"));
-    tl_jni_set_field(k, "encoded", "[B", spec ? tl_jni_get_field(spec, "encoded", "[B") : vl(NULL));
+    tl_jni_set_field(k, "encoded", "[B", vl(spec ? tl_jni_ref(tl_jni_get_field(spec, "encoded", "[B").l) : NULL));
     tl_jni_set_field(k, "algorithm", "Ljava/lang/String;", vl(STR("RSA")));
     c->ret = vl(k);
 }
@@ -135,7 +135,8 @@ static void Signature_getInstance(tl_jcall *c)
     snprintf(sig_of(s)->algo, sizeof(sig_of(s)->algo), "%s", S(c->args[0].l));
     c->ret = vl(s);
 }
-static void Signature_initVerify(tl_jcall *c) { sigstate *st = sig_of(c->self); st->key = c->args[0].l; st->n = 0; }
+/* The key is kept past the call that hands it over, so the state takes a reference of its own. */
+static void Signature_initVerify(tl_jcall *c) { sigstate *st = sig_of(c->self); jobj *old = st->key; st->key = tl_jni_ref(c->args[0].l); tl_jni_unref(old); st->n = 0; }
 static void sig_add(sigstate *st, const uint8_t *p, size_t n)
 {
     if (st->n + n > st->cap) { st->cap = (st->n + n) * 2; st->msg = realloc(st->msg, st->cap); }
