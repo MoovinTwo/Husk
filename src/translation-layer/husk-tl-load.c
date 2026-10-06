@@ -523,10 +523,12 @@ static bool is_valid_dual_mapping(const tl_dual_mapping *m)
  */
 tl_dual_mapping *tl_find_stikdebug_prewarmed(void)
 {
-    /* Ensure prewarm has been called in case this attempt ran before QEMU. */
+    /* Ensure prewarm has been called in case this attempt ran before QEMU.
+     * Prewarm is one-shot, so this must ask for the full region the app would
+     * have: a smaller one leaves QEMU's tb-size carve no room. */
     bool (*prewarm_fn)(size_t) = (bool (*)(size_t))dlsym(RTLD_DEFAULT, "husk_ios_jit_prewarm");
     if (prewarm_fn) {
-        prewarm_fn(256 * 1024 * 1024);
+        prewarm_fn(TL_JIT_REGION_BYTES);
     }
 
     tl_dual_mapping *(*get_fn)(void) = (tl_dual_mapping *(*)(void))dlsym(RTLD_DEFAULT, "husk_ios_jit_get_mapping");
