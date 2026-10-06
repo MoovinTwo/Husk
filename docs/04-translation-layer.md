@@ -173,6 +173,54 @@ and whether it survives into a signal handler. If it passes, Android code runs
 as it is. If it fails, every `mrs Xn, tpidr_el0` has to be rewritten at load
 time, and the scanner already counts them per library.
 
+The loader in `src/translation-layer-next` does not wait for that answer: it
+rewrites every `mrs Xt, tpidr_el0` regardless (`husk-tl-ld.c`, "thread
+blocks"). Each site becomes a branch to a 32-byte stub in the library's stub
+pages that uses nothing but `Xt`: it reads Darwin's TSD base from
+`TPIDRRO_EL0`, loads the value of a pthread key from its TSD slot (found once
+by planting a sentinel, as for the virtual x18), and if that is zero loads the
+address of a shared block from a literal, then branches back. So every thread
+that has a block of its own sees it, and the rest share one.
+
+A block is bionic's TCB: slots 0..7 at TP+0..63 (self, 1000, 1000, 0, 0, the
+stack-protector cookie, 0, 0), with a page before TP for bookkeeping and the
+negative slots bionic reserves. The cookie is one random value per process
+(`arc4random_buf`), the same in every block, so a function whose thread
+changes blocks between entry and exit still finds the same cookie. Guest
+threads get a block from the `pthread_create` shim; the drivers' long-lived
+threads (UnityMain, GLThread, UiThread, the start-up thread, Looper threads)
+call `tl_ld_thread_attach`. Blocks are released by the key's destructor,
+which re-arms itself until the last destructor round so that the guest's own
+TSD destructors still see the thread's block. The shared block lives in the
+executable region's writable view so that a site with no stub pool in branch
+range can still be given `adrp Xt, <shared block>`; the others are plain
+`mmap`ed data.
+
+The same blocks hold ELF TLS, laid out as bionic lays out static TLS on arm64
+(variant 1, `StaticTlsLayout` in bionic's `bionic_elf_tls.cpp`): after the
+eight slots at TP+0..63, each module's `PT_TLS` block at a TP offset assigned
+when the module is mapped, rounded up to its `p_align` with its
+`p_vaddr % p_align` skew kept. Every block has the same area for this,
+256 KiB by default (`TL_STATIC_TLS_KB`); a module that does not fit is refused
+with a message saying so, as is one asking for more than 4096-byte alignment,
+which is what TP is aligned to. bionic gives libraries `dlopen`ed after
+start-up dynamic TLS; here every module is static, so:
+
+- `R_AARCH64_TLS_TPREL64` (initial-exec) is the module's offset + the
+  symbol's + the addend;
+- `R_AARCH64_TLSDESC` gets bionic's static resolver (`ldr x0, [x0, #8]; ret`)
+  and that TP offset, or for an undefined weak symbol a resolver that returns
+  the addend minus this thread's TP, so the address comes out as the addend;
+- `R_AARCH64_TLS_DTPMOD64`/`DTPREL64` give a module id and an offset for
+  `__tls_get_addr`, which the shim answers as TP + the module's offset + the
+  offset.
+
+TLS symbols resolve as bionic resolves them: the library itself for its own
+definitions and for symbol 0, otherwise its scope. A module's `.tdata`/`.tbss`
+image is copied, after relocation, into every block that exists and then into
+each new block. Threads that share the fallback block share its thread-locals
+too.
+
 ### x18: measured on the phone
 
 Clang reserves x18 for both Android and iOS targets (checked: it allocates x18
@@ -196,6 +244,29 @@ This is the largest mechanical part of the loader. Structure layouts (`stat`,
 `pthread_mutex_t` sizes (40 bytes on bionic arm64, 64 on Darwin), and bionic's
 `__sF` stdio all differ. The scanner's per-app "Android libraries it needs"
 list is the list of what has to be provided.
+
+### Guest file paths: confined
+
+A game's native code runs inside Husk's own process, so without a check every
+path it opens would reach whatever Husk's sandbox can: guest images and other
+apps' data in Documents, Husk's preferences. Every path-taking bionic wrapper
+(`open`, `fopen`, `stat`, `mkdir`, `rename`, the `*at` calls and the rest)
+goes through `tl_path_confine` in `husk-tl-bionic-path.c` first. The path is
+made absolute against the guest's own working directory (kept by the shim, not
+the process), collapsed lexically, Android's locations (`/data/data/<pkg>`,
+`/data/user/0/<pkg>`, `/sdcard`) are moved into the app's data directory, and
+the result must lie under a root: the data directory (read-write), the APKs
+the loader opened and the app bundle (read-only), and `/dev/null`, `/dev/zero`,
+`/dev/random`, `/dev/urandom`. A write to a read-only root is `EACCES`;
+anything else is `ENOENT`. The deepest existing part of a path is resolved with
+`realpath` and checked again, so a symbolic link cannot lead out. The made-up
+`/proc` and `/sys` files are answered before the check.
+
+This is defence in depth, not a sandbox: native code in the process can still
+read Husk's memory, issue system calls itself, and race the check against a
+rename. `TL_PATH_UNCONFINED=1` turns the check off for the Mac harnesses in
+`tools/`; they run confined by default, with the APK they were given and the
+temporary data directory they make.
 
 ### 32-bit apps: not possible natively
 

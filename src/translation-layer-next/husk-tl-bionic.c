@@ -643,6 +643,7 @@ const tl_bionic_entry tl_tab_core[] = {
     TL_WRAP("dlerror", bionic_dlerror),
     TL_WRAP("dladdr", bionic_dladdr),
     TL_WRAP("dl_iterate_phdr", bionic_dl_iterate_phdr),
+    TL_WRAP("__tls_get_addr", tl_ld_tls_get_addr),
     TL_END
 };
 

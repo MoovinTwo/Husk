@@ -2,12 +2,14 @@
 #include "husk-tl-ld.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 
 #include "husk-tl-internal.h"
 #include "husk-tl-a64.h"
@@ -37,7 +39,7 @@ enum {
     DT_GNU_HASH_ = 0x6ffffef5, DT_ANDROID_RELA_ = 0x60000011, DT_ANDROID_RELASZ_ = 0x60000012,
     DT_ANDROID_RELR_ = 0x6fffe000, DT_ANDROID_RELRSZ_ = 0x6fffe001,
     R_NONE = 0, R_ABS64 = 257, R_GLOB_DAT = 1025, R_JUMP_SLOT = 1026, R_RELATIVE = 1027,
-    R_TLS_DTPMOD = 1028, R_TLS_TPREL = 1030, R_TLSDESC = 1031, R_IRELATIVE = 1032,
+    R_TLS_DTPMOD = 1028, R_TLS_DTPREL = 1029, R_TLS_TPREL = 1030, R_TLSDESC = 1031, R_IRELATIVE = 1032,
     STB_WEAK_ = 2, STT_TLS_ = 6, STT_GNU_IFUNC_ = 10, SHN_UNDEF_ = 0,
     PF_X_ = 1, PF_W_ = 2, PF_R_ = 4, EM_AARCH64_ = 183,
 };
@@ -82,6 +84,11 @@ struct tl_lib {
     size_t n_ctr;                  /* reads of CTR_EL0 replaced by a constant */
     size_t n_svc_far, n_adr_failed;   /* svc sites with no stub in branch range (answered ENOSYS), adr sites that could not be rewritten */
     size_t n_x18, n_x18_failed;    /* sites rewritten for the reserved register, and sites that could not be */
+    size_t n_tpidr_shared;         /* reads of TPIDR_EL0 with no stub in range, given the shared thread block */
+    /* ELF TLS: the PT_TLS segment, and where its block sits from every thread's TP; tls_id 0 = none */
+    uint64_t tls_vaddr, tls_filesz, tls_memsz;
+    size_t tls_off, tls_id;
+    bool tls_ready;                /* relocated, so its image may be copied into thread blocks */
     int state;                     /* 0 mapped, 1 relocating, 2 relocated, 3 initialising, 4 initialised */
     uint32_t n_unresolved;
 };
@@ -91,10 +98,10 @@ static struct {
     tl_lib *libs[MAX_LIBS];
     int nlibs;
     tl_zip apks[4];
+    char apk_paths[4][1024];
     int napks;
     int verbosity;
     size_t unresolved;
-    uint8_t *tcb_rx, *tcb_rw;      /* the fake thread block every `mrs tpidr_el0` reads */
     char **argv, **envp;
     bool recursive_init;
 } G = { .lock = PTHREAD_MUTEX_INITIALIZER, .verbosity = 1 };
@@ -117,11 +124,13 @@ bool tl_ld_add_apk(const char *path)
         tl_log_line("ld: cannot open %s: %s", path, err);
         return false;
     }
+    snprintf(G.apk_paths[G.napks], sizeof(G.apk_paths[0]), "%s", path);
     G.napks++;
     return true;
 }
 
 const tl_zip *tl_ld_apk_at(int i) { return (i >= 0 && i < G.napks) ? &G.apks[i] : NULL; }
+const char *tl_ld_apk_path(int i) { return (i >= 0 && i < G.napks) ? G.apk_paths[i] : NULL; }
 
 static bool fetch_from_apks(const char *name, uint8_t **out, size_t *len)
 {
@@ -178,9 +187,12 @@ static const elf_sym *sym_at(const tl_lib *L, uint32_t i)
     return (const elf_sym *)at(L, L->symtab) + i;
 }
 
-/* The address a defined symbol is known by: the writable view for data. */
+static void *tls_sym_addr(const tl_lib *L, const elf_sym *s);
+
+/* The address a defined symbol is known by: the writable view for data; a thread-local's, the calling thread's copy. */
 static void *sym_value(const tl_lib *L, const elf_sym *s)
 {
+    if ((s->st_info & 0xf) == STT_TLS_) return tls_sym_addr(L, s);
     uint64_t off = s->st_value - L->base_vaddr;
     size_t page = (size_t)(off / PAGE);
     bool is_func = (s->st_info & 0xf) == 2;
@@ -643,13 +655,17 @@ static uint8_t *svc_stub(tl_lib *L, const uint8_t *site_rx)
 
 static int64_t g_vx18_off = -1;     /* byte offset of the virtual-x18 slot from the TSD base */
 
-static bool vx18_init(void)
+/*
+ * Where a pthread key's value lives, as a byte offset from the TSD base that TPIDRRO_EL0 holds (low three bits
+ * masked off), so generated code can read and write it with one load or store and no call. Found by storing a
+ * sentinel and looking for it, because Darwin does not promise a key's slot index. -1 when it cannot be found, or
+ * is beyond what a scaled 12-bit load offset reaches.
+ */
+static int64_t tsd_slot_of(pthread_key_t key)
 {
-    if (g_vx18_off >= 0) return true;
 #if defined(__aarch64__)
-    pthread_key_t key;
-    if (pthread_key_create(&key, NULL)) return false;
     const uintptr_t sentinel = (uintptr_t)0x5a5a1234deadbeefull;
+    void *old = pthread_getspecific(key);
     pthread_setspecific(key, (void *)sentinel);
     uintptr_t base;
     __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(base));
@@ -657,13 +673,23 @@ static bool vx18_init(void)
     const volatile uintptr_t *tsd = (const volatile uintptr_t *)base;
     int64_t off = -1;
     for (int i = 0; i < 520; i++) if (tsd[i] == sentinel) { off = (int64_t)i * 8; break; }
-    pthread_setspecific(key, NULL);
-    if (off < 0 || off > 32760) { pthread_key_delete(key); return false; }
+    pthread_setspecific(key, old);
+    return off > 32760 ? -1 : off;
+#else
+    (void)key;
+    return -1;
+#endif
+}
+
+static bool vx18_init(void)
+{
+    if (g_vx18_off >= 0) return true;
+    pthread_key_t key;
+    if (pthread_key_create(&key, NULL)) return false;
+    int64_t off = tsd_slot_of(key);
+    if (off < 0) { pthread_key_delete(key); return false; }
     g_vx18_off = off;
     return true;
-#else
-    return false;
-#endif
 }
 
 /* The value of the calling thread's virtual x18, for a signal handler to save and restore around guest handlers. */
@@ -694,7 +720,8 @@ static inline uint32_t e_stur(unsigned rt, int imm)  { return 0xF8000000u | (((u
 static inline uint32_t e_ldur(unsigned rt, int imm)  { return 0xF8400000u | (((uint32_t)imm & 0x1FFu) << 12) | (31u << 5) | rt; }
 static inline uint32_t e_mrs_tsd(unsigned rt)        { return 0xD53BD060u | rt; }
 static inline uint32_t e_and_tsd(unsigned r)         { return 0x927DF000u | (r << 5) | r; }          /* and r, r, #~7 */
-static inline uint32_t e_ldr_slot(unsigned rt, unsigned rn) { return 0xF9400000u | ((uint32_t)(g_vx18_off / 8) << 10) | (rn << 5) | rt; }
+static inline uint32_t e_ldr_off(unsigned rt, unsigned rn, int64_t off) { return 0xF9400000u | ((uint32_t)(off / 8) << 10) | (rn << 5) | rt; }   /* ldr rt, [rn, #off] */
+static inline uint32_t e_ldr_slot(unsigned rt, unsigned rn) { return e_ldr_off(rt, rn, g_vx18_off); }
 static inline uint32_t e_str_slot(unsigned rt, unsigned rn) { return 0xF9000000u | ((uint32_t)(g_vx18_off / 8) << 10) | (rn << 5) | rt; }
 
 static int e_mov64(uint32_t *out, unsigned rd, uint64_t v)
@@ -820,6 +847,304 @@ static int x18_rewrite(tl_lib *L, uint32_t *site_rw, const uint8_t *pc, ptrdiff_
     return X18_DONE;
 }
 
+/* ------------------------------------------------------------ thread blocks */
+
+/*
+ * bionic's arm64 thread pointer (TPIDR_EL0) points at its thread control block: eight 8-byte slots at TP+0..63,
+ * of which compiled code reads TLS_SLOT_STACK_GUARD (TP+0x28) in every function built with a stack protector, plus
+ * three slots at negative offsets that only bionic itself uses. Darwin keeps its own thread pointer in TPIDRRO_EL0
+ * and gives TPIDR_EL0 no meaning a guest may rely on, so every `mrs Xt, tpidr_el0` is rewritten to produce the
+ * thread pointer of a block this file owns.
+ *
+ * Each thread that runs guest code for long gets its own block (tl_ld_thread_attach; guest threads get theirs
+ * from pthread_create's shim), its address kept as the value of a pthread key. The rewritten site branches to a
+ * stub that reads that key's TSD slot directly -- the same way the virtual x18 is reached -- using nothing but Xt:
+ *
+ *      mrs  Xt, tpidrro_el0        TSD base, with the CPU number in the low bits
+ *      and  Xt, Xt, #~7
+ *      ldr  Xt, [Xt, #slot]        this thread's block, or 0
+ *      cbnz Xt, 1f
+ *      ldr  Xt, =fallback          a thread with no block of its own shares one
+ *   1: b    <site + 4>
+ *
+ * Threads without a block (the main thread, short-lived host callbacks) share the fallback, which is what every
+ * thread shared before. The fallback lives in the executable region's writable view so that a site with no stub
+ * pool in branch range can still be given `adrp Xt, fallback`: blocks are plain data otherwise, mmap'd.
+ *
+ * ELF TLS lives in the same blocks, laid out as bionic lays out static TLS on arm64 (variant 1): after the eight
+ * slots, each module's PT_TLS block at a TP offset fixed when the module is mapped -- aligned to its p_align, with
+ * its p_vaddr % p_align skew kept, as StaticTlsLayout::reserve does -- in an area of a fixed size every block has
+ * (TL_STATIC_TLS_KB, 256 KiB by default; a module that does not fit is refused). TP is 4096-aligned, which bounds
+ * the p_align accepted. Bionic gives libraries dlopen'd after start-up dynamic TLS instead; here every module is
+ * static, so initial-exec (R_TLS_TPREL) works for all of them, TLSDESC resolves to bionic's static resolver
+ * (`ldr x0, [x0, #8]; ret`), and __tls_get_addr is TP + the module's offset + the offset asked for. A module's
+ * .tdata/.tbss image is copied into every existing block once the module is relocated, and into each new block
+ * as it is made. Threads sharing the fallback block share its thread-locals too.
+ *
+ * Every block carries the same stack-protector cookie, drawn at random once per process. It has to be the same
+ * for a function's entry and exit only, which one per thread would also be, but a guest thread can outlive or
+ * predate its block (key destructors run in some order; a callback can start on a thread before attaching), and a
+ * function that sees two blocks must still see one cookie.
+ */
+#define TCB_PRE   4096u            /* before TP: the block's bookkeeping, and bionic's negative slots (all zero) */
+#define TCB_SLOTS 64u              /* TP+0..63: bionic's slots 0..7 */
+#define TLS_ALIGN_MAX 4096u        /* TP's alignment in every block, so the largest PT_TLS p_align that can be honoured */
+
+typedef struct tcb_hdr { struct tcb_hdr *next, *prev; unsigned rounds; bool shared; } tcb_hdr;
+
+static struct {
+    pthread_mutex_t lock;          /* the list of blocks */
+    pthread_once_t once;
+    pthread_key_t key;             /* this thread's TP, or NULL */
+    bool have_key;
+    int64_t slot;                  /* the key's TSD slot offset, for the stubs; -1 if unknown */
+    size_t span;                   /* bytes from a block's start to its end */
+    uint64_t cookie;
+    uint8_t *fallback;             /* TP of the shared block, in the writable view */
+    tcb_hdr *live;                 /* every block, the fallback's included */
+    size_t area;                   /* bytes from TP to a block's end: the slots, then the modules' static TLS */
+    size_t cursor;                 /* the first TP offset no module has */
+    tl_lib *mods[MAX_LIBS];        /* modules with a PT_TLS, by id - 1 */
+    size_t nmods;
+    const uint8_t *desc_static, *desc_weak;   /* TLSDESC resolvers, executable */
+} T = { .lock = PTHREAD_MUTEX_INITIALIZER, .once = PTHREAD_ONCE_INIT, .slot = -1 };
+
+static inline tcb_hdr *tcb_of(uint8_t *tp) { return (tcb_hdr *)(tp - TCB_PRE); }
+
+/* A module's initial thread-local image into the block at tp: .tdata from the relocated image, .tbss zeroed. */
+static void tls_fill(uint8_t *tp, const tl_lib *L)
+{
+    uint8_t *d = tp + L->tls_off;
+    memcpy(d, at(L, L->tls_vaddr), (size_t)L->tls_filesz);
+    memset(d + L->tls_filesz, 0, (size_t)(L->tls_memsz - L->tls_filesz));
+}
+
+/* Lay out a new block at `base` and put it on the list. Called with T.lock held. */
+static uint8_t *tcb_setup(uint8_t *base, bool shared)
+{
+    uint8_t *tp = base + TCB_PRE;
+    uint64_t *s = (uint64_t *)tp;
+    s[0] = (uint64_t)(uintptr_t)tp;     /* self: what x86 code expects at slot 0, harmless where the DTV would be */
+    s[1] = 1000; s[2] = 1000;
+    s[5] = T.cookie;                    /* TLS_SLOT_STACK_GUARD */
+    tcb_hdr *h = tcb_of(tp);
+    h->shared = shared;
+    h->prev = NULL;
+    h->next = T.live;
+    if (T.live) T.live->prev = h;
+    T.live = h;
+    for (size_t i = 0; i < T.nmods; i++) if (T.mods[i]->tls_ready) tls_fill(tp, T.mods[i]);
+    return tp;
+}
+
+static void tcb_dtor(void *tp);
+
+static void tcb_init_once(void)
+{
+    arc4random_buf(&T.cookie, sizeof(T.cookie));
+    const char *kb = getenv("TL_STATIC_TLS_KB");
+    long k = kb ? strtol(kb, NULL, 10) : 256;
+    if (k < 4 || k > 65536) k = 256;
+    T.area = (size_t)k << 10;
+    T.cursor = TCB_SLOTS;
+    T.span = TCB_PRE + T.area;
+    T.span = (T.span + 4095u) & ~(size_t)4095u;
+    if (pthread_key_create(&T.key, tcb_dtor)) return;
+    T.have_key = true;
+    T.slot = tsd_slot_of(T.key);
+    if (T.slot < 0) tl_log_line("ld: no thread-specific slot for thread blocks; every thread will share one");
+}
+
+/* The calling thread's TP: its own block, or the shared one. */
+static uint8_t *tcb_current(void)
+{
+    uint8_t *tp = T.have_key ? pthread_getspecific(T.key) : NULL;
+    return tp ? tp : T.fallback;
+}
+
+static void tcb_release(uint8_t *tp)
+{
+    tcb_hdr *h = tcb_of(tp);
+    pthread_mutex_lock(&T.lock);
+    if (h->prev) h->prev->next = h->next; else T.live = h->next;
+    if (h->next) h->next->prev = h->prev;
+    pthread_mutex_unlock(&T.lock);
+    munmap(tp - TCB_PRE, T.span);
+}
+
+/*
+ * The key's destructor, at thread exit. Darwin clears the slot before calling it, after which the thread reads the
+ * shared block. Guest code still runs here -- its own pthread keys' destructors, which bionic calls in the same
+ * rounds -- so the block is put back and kept until the last round, PTHREAD_DESTRUCTOR_ITERATIONS, and only then
+ * released; keys whose destructors run after ours in that last round see the shared block.
+ */
+static void tcb_dtor(void *v)
+{
+    uint8_t *tp = v;
+    if (++tcb_of(tp)->rounds < PTHREAD_DESTRUCTOR_ITERATIONS && !pthread_setspecific(T.key, tp)) return;
+    tcb_release(tp);
+}
+
+bool tl_ld_thread_attach(void)
+{
+    pthread_once(&T.once, tcb_init_once);
+    if (!T.have_key) return false;
+    if (pthread_getspecific(T.key)) return true;
+    uint8_t *base = mmap(NULL, T.span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (base == MAP_FAILED) return false;
+    pthread_mutex_lock(&T.lock);
+    uint8_t *tp = tcb_setup(base, false);
+    pthread_mutex_unlock(&T.lock);
+    if (pthread_setspecific(T.key, tp)) { tcb_release(tp); return false; }
+    return true;
+}
+
+void tl_ld_thread_detach(void)
+{
+    if (!T.have_key) return;
+    uint8_t *tp = pthread_getspecific(T.key);
+    if (!tp) return;
+    pthread_setspecific(T.key, NULL);
+    tcb_release(tp);
+}
+
+/* The shared block, in the executable region so that `adrp` reaches it from code; and the per-process state. */
+static bool ensure_tcb(void)
+{
+    pthread_once(&T.once, tcb_init_once);
+    if (T.fallback) return true;
+    size_t n = (T.span + PAGE - 1) / PAGE * PAGE;
+    uint8_t *rx, *rw;
+    if (!tl_xmem_alloc(n, &rx, &rw)) return false;
+    memset(rw, 0, n);
+    pthread_mutex_lock(&T.lock);
+    T.fallback = tcb_setup(rw, true);
+    pthread_mutex_unlock(&T.lock);
+
+    /*
+     * TLSDESC resolvers. A descriptor is { resolver, argument }; code calls the resolver with x0 = the descriptor
+     * and adds the result to TP, and the resolver may change nothing but x0. Every module has static TLS, so the
+     * argument is already the TP offset (bionic's tlsdesc_resolver_static). An undefined weak thread-local must
+     * come out as address 0 + addend, so its resolver returns the argument minus this thread's TP, found the way
+     * the tpidr stubs find it (bionic's tlsdesc_resolver_unresolved_weak).
+     */
+    if (!tl_xmem_alloc(PAGE, &rx, &rw)) return false;
+    uint32_t *c = (uint32_t *)rw;
+    c[0] = 0xF9400400u;                             /* ldr  x0, [x0, #8] */
+    c[1] = 0xD65F03C0u;                             /* ret */
+    c[2] = c[3] = 0xD503201Fu;
+    uint32_t *w = c + 4;                            /* at +16 */
+    w[0] = 0xF81F0FE1u;                             /* str  x1, [sp, #-16]! */
+    if (T.slot >= 0) {
+        w[1] = e_mrs_tsd(1);                        /* mrs  x1, tpidrro_el0 */
+        w[2] = e_and_tsd(1);                        /* and  x1, x1, #~7 */
+        w[3] = e_ldr_off(1, 1, T.slot);             /* ldr  x1, [x1, #slot] */
+        w[4] = 0xB5000041u;                         /* cbnz x1, +8 */
+    } else {
+        w[1] = w[2] = w[3] = w[4] = 0xD503201Fu;    /* no slot: every thread has the shared block */
+    }
+    w[5] = 0x580000E1u;                             /* ldr  x1, +28  (the literal) */
+    w[6] = 0xF9400400u;                             /* ldr  x0, [x0, #8] */
+    w[7] = 0xCB010000u;                             /* sub  x0, x0, x1 */
+    w[8] = 0xF84107E1u;                             /* ldr  x1, [sp], #16 */
+    w[9] = 0xD65F03C0u;                             /* ret */
+    w[10] = w[11] = 0xD503201Fu;
+    uint64_t fb = (uint64_t)(uintptr_t)T.fallback;
+    memcpy(w + 12, &fb, 8);                         /* at +64 */
+    tl_xmem_flush(rx, 80);
+    T.desc_static = rx;
+    T.desc_weak = rx + 16;
+    return true;
+}
+
+/*
+ * Bionic's static TLS placement (align_checked, then reserve): the cursor rounded up to the next offset that is
+ * `skew` past a multiple of `align` (a power of two, skew < align), the module's block there, the cursor past it. False, with
+ * nothing changed, when the block would run past `area`.
+ */
+static bool tls_place(size_t *cursor, size_t area, uint64_t memsz, uint64_t align, uint64_t skew, size_t *off)
+{
+    if (!align || (align & (align - 1)) || skew >= align || memsz > area) return false;
+    uint64_t o = ((*cursor - skew + align - 1) & ~(align - 1)) + skew;
+    if (o < *cursor || o > area - memsz) return false;
+    *off = (size_t)o;
+    *cursor = (size_t)(o + memsz);
+    return true;
+}
+
+/* A PT_TLS segment's block in every thread's static TLS, logged and refused when it cannot have one. */
+static bool tls_reserve(const char *name, const elf_phdr *p, size_t *off)
+{
+    uint64_t align = p->p_align ? p->p_align : 1;
+    if (align & (align - 1)) { tl_log_line("ld: %s: its TLS segment's alignment %llu is not a power of two", name, (unsigned long long)align); return false; }
+    if (align > TLS_ALIGN_MAX) { tl_log_line("ld: %s: its TLS segment wants %llu-byte alignment, more than the %u thread blocks have", name, (unsigned long long)align, TLS_ALIGN_MAX); return false; }
+    if (p->p_filesz > p->p_memsz) { tl_log_line("ld: %s: its TLS segment's file size exceeds its memory size", name); return false; }
+    pthread_mutex_lock(&T.lock);
+    size_t before = T.cursor;
+    bool ok = T.nmods < MAX_LIBS && tls_place(&T.cursor, T.area, p->p_memsz, align, p->p_vaddr % align, off);
+    pthread_mutex_unlock(&T.lock);
+    if (!ok) tl_log_line("ld: %s: its %llu bytes of thread-local storage do not fit in the static TLS area "
+                         "(%zu of %zu bytes taken); raise TL_STATIC_TLS_KB", name, (unsigned long long)p->p_memsz, before, T.area);
+    return ok;
+}
+
+/* A mapped module's TLS block becomes known: it gets its module id. Its image is not copied until it is relocated. */
+static void tls_register(tl_lib *L)
+{
+    pthread_mutex_lock(&T.lock);
+    T.mods[T.nmods] = L;
+    L->tls_id = T.nmods + 1;
+    T.nmods++;
+    pthread_mutex_unlock(&T.lock);
+}
+
+/* A relocated module's initial image, into every block there is; blocks made later copy it themselves. */
+static void tls_publish(tl_lib *L)
+{
+    if (!L->tls_id) return;
+    pthread_mutex_lock(&T.lock);
+    for (tcb_hdr *h = T.live; h; h = h->next) tls_fill((uint8_t *)h + TCB_PRE, L);
+    L->tls_ready = true;
+    pthread_mutex_unlock(&T.lock);
+}
+
+static void *tls_sym_addr(const tl_lib *L, const elf_sym *s)
+{
+    uint8_t *tp = tcb_current();
+    return tp && L->tls_id ? tp + L->tls_off + s->st_value : NULL;
+}
+
+/* bionic's __tls_get_addr: every module is in static TLS, so it is one addition from the calling thread's TP. */
+void *tl_ld_tls_get_addr(const tl_tls_index *ti)
+{
+    uint8_t *tp = tcb_current();
+    if (!tp || !ti || !ti->module || ti->module > T.nmods) return NULL;
+    return tp + T.mods[ti->module - 1]->tls_off + ti->offset;
+}
+
+/*
+ * The stub a `mrs Xt, tpidr_el0` at site_rx branches to (see above): 32 bytes, the last 8 the fallback's address.
+ * False when no TSD slot is known or no stub pool is in range; the caller then points Xt at the shared block.
+ */
+static bool tpidr_stub(tl_lib *L, const uint8_t *site_rx, unsigned rt, uint32_t *branch)
+{
+    uint8_t *rx, *rw; const uint8_t *lit;
+    if (T.slot < 0 || !stub_slot(L, site_rx, &rx, &rw, &lit)) return false;
+    uint32_t code[6] = {
+        e_mrs_tsd(rt),                  /* mrs  Xt, tpidrro_el0 */
+        e_and_tsd(rt),                  /* and  Xt, Xt, #~7 */
+        e_ldr_off(rt, rt, T.slot),      /* ldr  Xt, [Xt, #slot] */
+        0xB5000040u | rt,               /* cbnz Xt, +8  (to the branch back) */
+        0x58000040u | rt,               /* ldr  Xt, +8  (the literal) */
+        e_b(rx + 20, site_rx + 4),      /* b    site+4 */
+    };
+    uint64_t fb = (uint64_t)(uintptr_t)T.fallback;
+    memcpy(rw, code, sizeof(code));
+    memcpy(rw + 24, &fb, 8);
+    *branch = e_b(site_rx, rx);
+    return true;
+}
+
 /* --------------------------------------------------------------- patching */
 
 #if defined(__aarch64__)
@@ -832,13 +1157,11 @@ static uint32_t encode_adrp(uint32_t rt, const void *pc, const void *target)
 }
 
 /*
- * Two rewrites in executable pages, both on the writable view:
+ * Rewrites in executable pages, all on the writable view; among them:
  *
- *  - `mrs Xt, tpidr_el0` becomes `adrp Xt, <fake thread block>`. Android code
- *    reads its stack-protector cookie from [tpidr_el0 + 0x28]; Darwin keeps its
- *    own thread pointer elsewhere and leaves this register for nothing in
- *    particular. Every thread sharing one cookie is harmless: the cookie only has
- *    to be the same at a function's entry and exit.
+ *  - `mrs Xt, tpidr_el0` becomes a branch to a stub that produces the calling
+ *    thread's block (see "thread blocks"); where no stub is in branch range, an
+ *    `adrp Xt` of the block threads without their own share.
  *  - an `adrp` that points into this image's writable pages is retargeted at the
  *    writable view, because code reaches its globals pc-relatively and the page
  *    the executable view shows is not writable.
@@ -857,6 +1180,16 @@ static void patch_image(tl_lib *L, size_t *n_tpidr, size_t *n_adrp, size_t *n_ad
         for (size_t i = 0; i < nwords; i++) {
             uint32_t insn = w[i];
             const uint8_t *pc = x + i * 4;
+            if ((insn & 0xFFFFFFE0u) == 0xD53BD040u) {                  /* mrs Xt, tpidr_el0 */
+                unsigned rt = insn & 0x1Fu;
+                uint32_t branch;
+                if (rt == 31) w[i] = 0xD503201Fu;                       /* into xzr: nothing to produce */
+                else if (rt == 18) { L->n_x18_failed++; continue; }     /* Android's compilers never allocate x18 */
+                else if (tpidr_stub(L, pc, rt, &branch)) w[i] = branch;
+                else { w[i] = encode_adrp(rt, pc, T.fallback); L->n_tpidr_shared++; }
+                (*n_tpidr)++;
+                continue;
+            }
             int xr = x18_rewrite(L, &w[i], pc, delta);
             if (xr == X18_DONE) { L->n_x18++; continue; }
             if (xr == X18_FAILED) { L->n_x18_failed++; continue; }
@@ -866,9 +1199,6 @@ static void patch_image(tl_lib *L, size_t *n_tpidr, size_t *n_adrp, size_t *n_ad
                 uint32_t branch;
                 if (adr_stub(L, pc, insn & 0x1Fu, 0x8444c004ull, &branch)) { w[i] = branch; L->n_ctr++; }
                 else L->n_adr_failed++;
-            } else if ((insn & 0xFFFFFFE0u) == 0xD53BD040u) {            /* mrs Xt, tpidr_el0 */
-                w[i] = encode_adrp(insn & 0x1Fu, pc, G.tcb_rw);
-                (*n_tpidr)++;
             } else if ((insn & 0x9F000000u) == 0x90000000u) {     /* adrp */
                 int64_t imm = (int64_t)((((insn >> 5) & 0x7FFFFu) << 2) | ((insn >> 29) & 3u));
                 if (imm & 0x100000) imm -= 0x200000;
@@ -971,10 +1301,46 @@ static uint64_t run_ifunc_resolver(const void *fn)
     return resolver(arg.hwcap | IFUNC_ARG_HWCAP, &arg);
 }
 
+/*
+ * The module a TLS relocation's symbol lives in, and the symbol's offset in that module's TLS block, found as
+ * bionic finds it: the relocating library itself for symbol 0 and for its own non-weak definitions, otherwise its
+ * scope. `*mod` is NULL for an undefined weak symbol, which bionic evaluates at offset 0.
+ */
+static bool tls_target(tl_lib *L, uint32_t symidx, tl_lib **mod, uint64_t *value)
+{
+    *mod = NULL; *value = 0;
+    if (symidx == 0) {
+        if (!L->tls_id) { tl_log_line("ld: %s: a TLS relocation with no symbol, and no TLS segment", L->name); return false; }
+        *mod = L;
+        return true;
+    }
+    const elf_sym *s = sym_at(L, symidx), *d = NULL;
+    const char *name = sym_name(L, s);
+    tl_lib *in = NULL;
+    if (s->st_shndx != SHN_UNDEF_ && (s->st_info >> 4) != STB_WEAK_) { d = s; in = L; }
+    else {
+        build_scope(L);
+        if ((d = lib_find(L, name))) in = L;
+        for (int i = 0; !d && i < L->ndeps; i++) if ((d = lib_find(L->deps[i], name))) in = L->deps[i];
+    }
+    if (!d) {
+        if ((s->st_info >> 4) == STB_WEAK_) return true;
+        tl_log_line("ld: %s: thread-local %s is not defined by any library it can see", L->name, name);
+        return false;
+    }
+    if ((d->st_info & 0xf) != STT_TLS_ || !in->tls_id) {
+        tl_log_line("ld: %s: TLS relocation against %s, which %s does not define as thread-local", L->name, name, in->name);
+        return false;
+    }
+    *mod = in;
+    *value = d->st_value;
+    return true;
+}
+
 static bool reloc_one(tl_lib *L, uint64_t r_offset, uint32_t type, uint32_t symidx, int64_t addend)
 {
     uint64_t off = r_offset - L->base_vaddr;
-    if (off + 8 > L->npages * PAGE) return false;
+    if (off + (type == R_TLSDESC ? 16 : 8) > L->npages * PAGE) return false;
     uint64_t *place = (uint64_t *)(L->rw + off);
     bool failed = false;
     switch (type) {
@@ -995,9 +1361,20 @@ static bool reloc_one(tl_lib *L, uint64_t r_offset, uint32_t type, uint32_t symi
         /* The resolver is guest code: run it, store what it returns. */
         *place = run_ifunc_resolver(L->rx + ((uint64_t)addend - L->base_vaddr));
         return true;
-    case R_TLS_DTPMOD: case R_TLS_TPREL: case R_TLSDESC:
-        tl_log_line("ld: %s: TLS relocation (type %u) -- thread-local storage is not implemented", L->name, type);
-        return false;
+    case R_TLS_TPREL: case R_TLS_DTPMOD: case R_TLS_DTPREL: case R_TLSDESC: {
+        /* Every module's block is in static TLS (see "thread blocks"), so each of these is a constant now. */
+        tl_lib *m; uint64_t v;
+        if (!tls_target(L, symidx, &m, &v)) return false;
+        uint64_t tpoff = (m ? m->tls_off : 0) + v + (uint64_t)addend;
+        if (type == R_TLS_TPREL) *place = tpoff;
+        else if (type == R_TLS_DTPMOD) *place = m ? m->tls_id : 0;
+        else if (type == R_TLS_DTPREL) *place = v + (uint64_t)addend;      /* arm64's TLS_DTV_OFFSET is 0 */
+        else {
+            place[0] = (uint64_t)(uintptr_t)(m ? T.desc_static : T.desc_weak);
+            place[1] = m ? tpoff : (uint64_t)addend;
+        }
+        return true;
+    }
     default:
         tl_log_line("ld: %s: unsupported relocation type %u", L->name, type);
         return false;
@@ -1126,17 +1503,6 @@ static void parse_dynamic(tl_lib *L, uint64_t dyn_vaddr, uint64_t dyn_size)
     }
 }
 
-static bool ensure_tcb(void)
-{
-    if (G.tcb_rw) return true;
-    if (!tl_xmem_alloc(PAGE, &G.tcb_rx, &G.tcb_rw)) return false;
-    uint64_t *t = (uint64_t *)G.tcb_rw;
-    t[0] = (uint64_t)(uintptr_t)G.tcb_rw;      /* self */
-    t[1] = 1000; t[2] = 1000;
-    t[5] = 0xdeadbeefcafebabeull;             /* [tpidr_el0 + 0x28]: the stack cookie */
-    return true;
-}
-
 static tl_lib *map_library(const char *name, uint8_t *file, size_t flen)
 {
     if (G.nlibs >= MAX_LIBS) { tl_log_line("ld: too many libraries"); return NULL; }
@@ -1152,6 +1518,7 @@ static tl_lib *map_library(const char *name, uint8_t *file, size_t flen)
     }
     tl_segment loads[16]; int nloads = 0; tl_segment relro = {0}; bool has_relro = false;
     uint64_t dyn_v = 0, dyn_n = 0;
+    const elf_phdr *tls = NULL;
     elf_phdr *phs = malloc((size_t)eh->e_phnum * sizeof(elf_phdr));
     if (!phs) return NULL;
     for (unsigned i = 0; i < eh->e_phnum; i++) {
@@ -1165,9 +1532,7 @@ static tl_lib *map_library(const char *name, uint8_t *file, size_t flen)
         } else if (p->p_type == PT_DYNAMIC_) {
             dyn_v = p->p_vaddr; dyn_n = p->p_filesz;
         } else if (p->p_type == PT_TLS_) {
-            tl_log_line("ld: %s has a PT_TLS segment -- thread-local storage is not implemented", name);
-            free(phs);
-            return NULL;
+            tls = p;
         }
     }
     if (!nloads || !dyn_n) { tl_log_line("ld: %s has no loadable or dynamic segments", name); free(phs); return NULL; }
@@ -1177,6 +1542,13 @@ static tl_lib *map_library(const char *name, uint8_t *file, size_t flen)
     if (!npages) { tl_log_line("ld: %s: unusable page layout", name); free(phs); return NULL; }
     uint8_t *flags = malloc(npages);
     tl_page_plan(loads, (size_t)nloads, has_relro ? &relro : NULL, PAGE, flags, npages, &base_vaddr);
+    size_t tls_off = 0;
+    if (tls && (tls->p_vaddr < base_vaddr || tls->p_vaddr - base_vaddr + tls->p_filesz > npages * PAGE)) {
+        tl_log_line("ld: %s: its TLS segment is outside the image", name);
+        free(flags); free(phs);
+        return NULL;
+    }
+    if (tls && !tls_reserve(name, tls, &tls_off)) { free(flags); free(phs); return NULL; }
 
     /* The executable sections, from the section headers when the file has them (it almost always does);
      * otherwise whole executable segments, which is correct for a library with nothing but code in them. */
@@ -1202,13 +1574,15 @@ static tl_lib *map_library(const char *name, uint8_t *file, size_t flen)
     }
 
     /* Stub pages after the image: one literal slot, a few probes, a stub for every raw
-     * system call, and one for every instruction that names the reserved register x18. */
+     * system call and read of the thread pointer, and one for every instruction that
+     * names the reserved register x18. */
     size_t stub_bytes = 16 + 8192;
     for (int r = 0; r < ncode; r++) {
         const uint32_t *wv = (const uint32_t *)(file + code[r].foff);
         for (size_t k = 0, cnt = (size_t)(code[r].size / 4); k < cnt; k++) {
             uint32_t v = wv[k];
             if (v == 0xD4000001u) stub_bytes += 32;
+            else if ((v & 0xFFFFFFE0u) == 0xD53BD040u) stub_bytes += 32;                 /* mrs Xt, TPIDR_EL0 */
             else if ((v & 0xFFFFFFE0u) == 0xD53B0020u) stub_bytes += 32;                 /* mrs Xt, CTR_EL0 */
             else if ((v & 0x9F000000u) == 0x10000000u) {                 /* adr: a stub if it reaches writable data */
                 int64_t imm = (int64_t)((((v >> 5) & 0x7FFFFu) << 2) | ((v >> 29) & 3u));
@@ -1263,6 +1637,10 @@ static tl_lib *map_library(const char *name, uint8_t *file, size_t flen)
     if (!L->soname[0]) snprintf(L->soname, sizeof(L->soname), "%s", name);
     L->nsyms = count_dynsyms(L);
     if (L->nsyms) L->symcache = calloc(L->nsyms, sizeof(uint64_t));
+    if (tls) {
+        L->tls_vaddr = tls->p_vaddr; L->tls_filesz = tls->p_filesz; L->tls_memsz = tls->p_memsz; L->tls_off = tls_off;
+        tls_register(L);
+    }
     G.libs[G.nlibs++] = L;
     return L;
 }
@@ -1303,6 +1681,9 @@ static bool relocate(tl_lib *L)
         if (ad) tl_log_line("ld:   %s: %zu 'adr' instructions that reach writable data rewritten", L->name, ad);
         if (L->n_adr_failed) tl_log_line("ld:   %s: %zu 'adr' instructions reach writable data and could not be rewritten", L->name, L->n_adr_failed);
         if (L->n_ctr) tl_log_line("ld:   %s: %zu reads of CTR_EL0 replaced by a constant", L->name, L->n_ctr);
+        if (L->tls_id) tl_log_line("ld:   %s: %llu bytes of thread-local storage at TP+%#zx (module %zu)", L->name,
+                                   (unsigned long long)L->tls_memsz, L->tls_off, L->tls_id);
+        if (L->n_tpidr_shared) tl_log_line("ld:   %s: %zu reads of TPIDR_EL0 have no stub in range and see the shared thread block", L->name, L->n_tpidr_shared);
         if (L->n_svc_far) tl_log_line("ld:   %s: %zu raw system-call sites are out of branch range of the stubs and answer ENOSYS", L->name, L->n_svc_far);
         if (sv) tl_log_line("ld:   %s: %zu raw system-call sites rewritten", L->name, sv);
         if (L->n_x18 || L->n_x18_failed) tl_log_line("ld:   %s: %zu instructions using x18 rewritten for the virtual register%s", L->name, L->n_x18,
@@ -1341,6 +1722,7 @@ static tl_lib *load_locked(const char *name, int depth)
     }
     build_scope(L);
     if (!relocate(L)) return NULL;
+    tls_publish(L);
     return L;
 }
 

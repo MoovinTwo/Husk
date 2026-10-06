@@ -37,21 +37,19 @@
 #include <unistd.h>
 #include <utime.h>
 
-/* ------------------------------------------------------------ path mapping */
+/* ------------------------------------------------------------ made-up files */
 
 /*
- * Android paths the guest expects, mapped to somewhere that exists. The data
- * directory is wherever the host set aside for this app; /proc files that apps read
- * to learn about the device are synthesised into unlinked temporary files.
+ * /proc files that apps read to learn about the device are synthesised into unlinked
+ * temporary files. Every other path goes through tl_path_confine (husk-tl-bionic-path.c),
+ * which moves Android's locations into the app's data directory and refuses what is
+ * outside it; the made-up ones are answered first, since nothing real is behind them.
  */
-static char g_data_dir[512];
-void tl_set_data_dir(const char *dir) { snprintf(g_data_dir, sizeof(g_data_dir), "%s", dir ? dir : ""); }
-const char *tl_data_dir(void) { return g_data_dir[0] ? g_data_dir : "/tmp"; }
 
 /* A file holding `content`, already unlinked. Where it can be made depends on the host: iOS gives an app no /tmp. */
 static int synth_file(const char *content)
 {
-    const char *dirs[3] = { g_data_dir[0] ? g_data_dir : NULL, getenv("TMPDIR"), "/tmp" };
+    const char *dirs[3] = { tl_data_dir(), getenv("TMPDIR"), "/tmp" };
     char tmpl[1100];
     int fd = -1;
     for (int i = 0; i < 3 && fd < 0; i++) {
@@ -102,27 +100,10 @@ int tl_synth_open(const char *path)
     return s ? synth_file(s) : -1;
 }
 
-const char *tl_path_resolve(const char *path, char *buf, size_t n)
-{
-    if (!path) return path;
-    const char *pkg = "/data/data/";
-    if (!strncmp(path, pkg, strlen(pkg))) {
-        const char *rest = strchr(path + strlen(pkg), '/');
-        snprintf(buf, n, "%s%s", tl_data_dir(), rest ? rest : "");
-        return buf;
-    }
-    if (!strncmp(path, "/data/user/0/", 13)) {
-        const char *rest = strchr(path + 13, '/');
-        snprintf(buf, n, "%s%s", tl_data_dir(), rest ? rest : "");
-        return buf;
-    }
-    if (!strncmp(path, "/sdcard", 7) || !strncmp(path, "/storage/emulated/0", 19)) {
-        const char *rest = !strncmp(path, "/sdcard", 7) ? path + 7 : path + 19;
-        snprintf(buf, n, "%s/sdcard%s", tl_data_dir(), rest);
-        return buf;
-    }
-    return path;
-}
+/* The host path for a guest one, or the wrapper returns `failed` with the guest's errno already set. */
+#define CONFINE(var, path, how, failed) \
+    char var[PATH_MAX]; \
+    if (!tl_path_confine((path), (how), var, sizeof(var))) return failed
 
 /* ----------------------------------------------------------- open & friends */
 
@@ -152,14 +133,16 @@ static int oflags_from_darwin(int d)
 
 static int b_open(const char *path, int flags, unsigned mode)
 {
-    char buf[1024], content[8192];
-    const char *real = tl_path_resolve(path, buf, sizeof(buf));
-    const char *s = synth_content(path, content, sizeof(content));
+    char content[8192];
+    const char *s = path ? synth_content(path, content, sizeof(content)) : NULL;
     if (s) {
         int fd = synth_file(s);
         if (fd < 0) tl_set_guest_errno(2);
         return fd;
     }
+    /* Opening to write, or with O_CREAT, O_TRUNC or O_APPEND, needs a writable root; O_NOFOLLOW leaves a final link alone. */
+    int how = ((flags & 3) || (flags & (0x40 | 0x200 | 0x400)) ? TL_PATH_WRITE : TL_PATH_READ) | ((flags & 0x8000) ? TL_PATH_NOFOLLOW : 0);
+    CONFINE(real, path, how, -1);
     TL_ERRNO_BEGIN();
     int fd = open(real, oflags_to_darwin(flags), mode);
     int e = errno;
@@ -202,25 +185,39 @@ static int b_dup2(int a, int b) { TL_ERRNO_BEGIN(); int r = dup2(a, b); TL_ERRNO
 static int b_pipe(int fds[2]) { TL_ERRNO_BEGIN(); int r = pipe(fds); TL_ERRNO_END(); return r; }
 static int b_fsync(int fd) { TL_ERRNO_BEGIN(); int r = fsync(fd); TL_ERRNO_END(); return r; }
 static int b_ftruncate(int fd, long n) { TL_ERRNO_BEGIN(); int r = ftruncate(fd, n); TL_ERRNO_END(); return r; }
-static int b_truncate(const char *p, long n) { char b[1024]; TL_ERRNO_BEGIN(); int r = truncate(tl_path_resolve(p, b, sizeof(b)), n); TL_ERRNO_END(); return r; }
+static int b_truncate(const char *p, long n) { CONFINE(b, p, TL_PATH_WRITE, -1); TL_ERRNO_BEGIN(); int r = truncate(b, n); TL_ERRNO_END(); return r; }
 static int b_isatty(int fd) { int r = isatty(fd); if (!r) tl_set_guest_errno(25); return r; }
 static int b_flock(int fd, int op) { TL_ERRNO_BEGIN(); int r = flock(fd, op); TL_ERRNO_END(); return r; }
 
-#define PATH1(rt, name, call) \
-    static rt b_##name(const char *p) { char b[1024]; TL_ERRNO_BEGIN(); rt r = call(tl_path_resolve(p, b, sizeof(b))); TL_ERRNO_END(); return r; }
-PATH1(int, unlink, unlink)
-PATH1(int, rmdir, rmdir)
-static int b_mkdir(const char *p, unsigned mode) { char b[1024]; TL_ERRNO_BEGIN(); int r = mkdir(tl_path_resolve(p, b, sizeof(b)), (mode_t)mode); TL_ERRNO_END(); return r; }
-static int b_access(const char *p, int m) { char b[1024]; TL_ERRNO_BEGIN(); int r = access(tl_path_resolve(p, b, sizeof(b)), m); TL_ERRNO_END(); return r; }
-static int b_chmod(const char *p, unsigned m) { char b[1024]; TL_ERRNO_BEGIN(); int r = chmod(tl_path_resolve(p, b, sizeof(b)), (mode_t)m); TL_ERRNO_END(); return r; }
+#define PATH1(rt, name, call, how) \
+    static rt b_##name(const char *p) { CONFINE(b, p, how, -1); TL_ERRNO_BEGIN(); rt r = call(b); TL_ERRNO_END(); return r; }
+PATH1(int, unlink, unlink, TL_PATH_WRITE | TL_PATH_NOFOLLOW)
+PATH1(int, rmdir, rmdir, TL_PATH_WRITE | TL_PATH_NOFOLLOW)
+static int b_mkdir(const char *p, unsigned mode)
+{
+    char b[PATH_MAX];
+    if (!tl_path_confine(p, TL_PATH_WRITE | TL_PATH_NOFOLLOW, b, sizeof(b))) {
+        /* Code that makes a path one directory at a time from "/" expects EEXIST for the ones above the data directory. */
+        int e = *tl_guest_errno_ptr();
+        struct stat s;
+        tl_set_guest_errno(tl_path_confine(p, TL_PATH_META, b, sizeof(b)) && stat(b, &s) == 0 ? 17 : e);
+        return -1;
+    }
+    TL_ERRNO_BEGIN(); int r = mkdir(b, (mode_t)mode); TL_ERRNO_END(); return r;
+}
+/* Asking whether a path could be written needs a writable root; asking whether it exists or can be read is metadata. */
+static int b_access(const char *p, int m) { CONFINE(b, p, (m & W_OK) ? TL_PATH_WRITE : TL_PATH_META, -1); TL_ERRNO_BEGIN(); int r = access(b, m); TL_ERRNO_END(); return r; }
+static int b_chmod(const char *p, unsigned m) { CONFINE(b, p, TL_PATH_WRITE, -1); TL_ERRNO_BEGIN(); int r = chmod(b, (mode_t)m); TL_ERRNO_END(); return r; }
 static int b_fchmod(int fd, unsigned m) { TL_ERRNO_BEGIN(); int r = fchmod(fd, (mode_t)m); TL_ERRNO_END(); return r; }
-static int b_link(const char *a, const char *b2) { char x[1024], y[1024]; TL_ERRNO_BEGIN(); int r = link(tl_path_resolve(a, x, sizeof(x)), tl_path_resolve(b2, y, sizeof(y))); TL_ERRNO_END(); return r; }
-static int b_symlink(const char *a, const char *b2) { char y[1024]; TL_ERRNO_BEGIN(); int r = symlink(a, tl_path_resolve(b2, y, sizeof(y))); TL_ERRNO_END(); return r; }
-static long b_readlink(const char *p, char *buf, size_t n) { char b[1024]; TL_ERRNO_BEGIN(); long r = readlink(tl_path_resolve(p, b, sizeof(b)), buf, n); TL_ERRNO_END(); return r; }
-static char *b_realpath(const char *p, char *out) { char b[1024]; TL_ERRNO_BEGIN(); char *r = realpath(tl_path_resolve(p, b, sizeof(b)), out); TL_ERRNO_END(); return r; }
-static char *b_getcwd(char *buf, size_t n) { TL_ERRNO_BEGIN(); char *r = getcwd(buf, n); TL_ERRNO_END(); return r; }
-static int b_utimes(const char *p, const struct timeval tv[2]) { char b[1024]; TL_ERRNO_BEGIN(); int r = utimes(tl_path_resolve(p, b, sizeof(b)), tv); TL_ERRNO_END(); return r; }
-static int b_utime(const char *p, const struct utimbuf *t) { char b[1024]; TL_ERRNO_BEGIN(); int r = utime(tl_path_resolve(p, b, sizeof(b)), t); TL_ERRNO_END(); return r; }
+/* The new name for a file must be writable, and so must the file: a second name for a read-only one would be a way to write it. */
+static int b_link(const char *a, const char *b2) { CONFINE(x, a, TL_PATH_WRITE, -1); CONFINE(y, b2, TL_PATH_WRITE | TL_PATH_NOFOLLOW, -1); TL_ERRNO_BEGIN(); int r = link(x, y); TL_ERRNO_END(); return r; }
+/* A link's target is only text until something follows it, and following it is checked then. */
+static int b_symlink(const char *a, const char *b2) { CONFINE(y, b2, TL_PATH_WRITE | TL_PATH_NOFOLLOW, -1); TL_ERRNO_BEGIN(); int r = symlink(a, y); TL_ERRNO_END(); return r; }
+static long b_readlink(const char *p, char *buf, size_t n) { CONFINE(b, p, TL_PATH_READ | TL_PATH_NOFOLLOW, -1); TL_ERRNO_BEGIN(); long r = readlink(b, buf, n); TL_ERRNO_END(); return r; }
+static char *b_realpath(const char *p, char *out) { CONFINE(b, p, TL_PATH_META, NULL); TL_ERRNO_BEGIN(); char *r = realpath(b, out); TL_ERRNO_END(); return r; }
+static char *b_getcwd(char *buf, size_t n) { return tl_path_getcwd(buf, n); }
+static int b_utimes(const char *p, const struct timeval tv[2]) { CONFINE(b, p, TL_PATH_WRITE, -1); TL_ERRNO_BEGIN(); int r = utimes(b, tv); TL_ERRNO_END(); return r; }
+static int b_utime(const char *p, const struct utimbuf *t) { CONFINE(b, p, TL_PATH_WRITE, -1); TL_ERRNO_BEGIN(); int r = utime(b, t); TL_ERRNO_END(); return r; }
 static int b_futimens(int fd, const struct timespec ts[2]) { TL_ERRNO_BEGIN(); int r = futimens(fd, ts); TL_ERRNO_END(); return r; }
 static unsigned b___umask_chk(unsigned m) { return umask((mode_t)m); }
 
@@ -260,16 +257,18 @@ static void fill_stat(guest_stat *g, const struct stat *s)
 }
 static int b_stat(const char *p, guest_stat *g)
 {
-    char b[1024], c[8192]; struct stat s;
-    if (synth_content(p, c, sizeof(c))) { memset(g, 0, sizeof(*g)); g->st_mode = S_IFREG | 0444; g->st_nlink = 1; return 0; }
-    TL_ERRNO_BEGIN(); int r = stat(tl_path_resolve(p, b, sizeof(b)), &s); TL_ERRNO_END();
+    char c[8192]; struct stat s;
+    if (p && synth_content(p, c, sizeof(c))) { memset(g, 0, sizeof(*g)); g->st_mode = S_IFREG | 0444; g->st_nlink = 1; return 0; }
+    CONFINE(b, p, TL_PATH_META, -1);
+    TL_ERRNO_BEGIN(); int r = stat(b, &s); TL_ERRNO_END();
     if (r == 0) fill_stat(g, &s);
     return r;
 }
 static int b_lstat(const char *p, guest_stat *g)
 {
-    char b[1024]; struct stat s;
-    TL_ERRNO_BEGIN(); int r = lstat(tl_path_resolve(p, b, sizeof(b)), &s); TL_ERRNO_END();
+    struct stat s;
+    CONFINE(b, p, TL_PATH_META | TL_PATH_NOFOLLOW, -1);
+    TL_ERRNO_BEGIN(); int r = lstat(b, &s); TL_ERRNO_END();
     if (r == 0) fill_stat(g, &s);
     return r;
 }
@@ -284,8 +283,9 @@ static int b_fstat(int fd, guest_stat *g)
 typedef struct { int64_t f_type, f_bsize, f_blocks, f_bfree, f_bavail, f_files, f_ffree; int32_t fsid[2]; int64_t f_namelen, f_frsize, f_flags, spare[4]; } guest_statfs;
 static int b_statfs(const char *p, guest_statfs *g)
 {
-    char b[1024]; struct statfs s;
-    TL_ERRNO_BEGIN(); int r = statfs(tl_path_resolve(p, b, sizeof(b)), &s); TL_ERRNO_END();
+    struct statfs s;
+    CONFINE(b, p, TL_PATH_META, -1);
+    TL_ERRNO_BEGIN(); int r = statfs(b, &s); TL_ERRNO_END();
     if (r == 0) {
         memset(g, 0, sizeof(*g));
         g->f_type = 0xEF53; g->f_bsize = s.f_bsize; g->f_blocks = s.f_blocks; g->f_bfree = s.f_bfree;
@@ -337,8 +337,8 @@ typedef struct { DIR *dir; guest_dirent ent; } guest_dir;
 
 static void *b_opendir(const char *p)
 {
-    char b[1024];
-    TL_ERRNO_BEGIN(); DIR *d = opendir(tl_path_resolve(p, b, sizeof(b))); TL_ERRNO_END();
+    CONFINE(b, p, TL_PATH_READ, NULL);
+    TL_ERRNO_BEGIN(); DIR *d = opendir(b); TL_ERRNO_END();
     if (!d) return NULL;
     guest_dir *g = calloc(1, sizeof(*g));
     g->dir = d;
@@ -917,33 +917,30 @@ const tl_bionic_entry tl_tab_io[] = {
 
 /* ------------------------------------------------------- *at, stat64, statvfs */
 
-/* The guest's AT_FDCWD is -100. With it (or an absolute path) the call is the plain one; with a real directory
- * descriptor Darwin resolves the path against it, which is what the guest meant. */
-#define G_AT_FDCWD (-100)
+/* The guest's AT_FDCWD is -100. A path relative to a real directory descriptor is turned into the path under that
+ * directory (tl_path_at) and given to the plain call, so it is confined like any other rather than resolved by
+ * Darwin against a descriptor nothing has checked. */
 #define G_AT_REMOVEDIR 0x200
 #define G_AT_SYMLINK_NOFOLLOW 0x100
-static bool at_plain(int dirfd, const char *p) { return dirfd == G_AT_FDCWD || (p && p[0] == '/'); }
 static int b_openat(int dirfd, const char *path, int flags, unsigned mode)
 {
-    if (at_plain(dirfd, path)) return b_open(path, flags, mode);
-    TL_ERRNO_BEGIN(); int fd = openat(dirfd, path, oflags_to_darwin(flags), mode); TL_ERRNO_END();
-    return fd;
+    char b[PATH_MAX]; const char *p = tl_path_at(dirfd, path, b, sizeof(b));
+    return p ? b_open(p, flags, mode) : -1;
 }
 static int b_unlinkat(int dirfd, const char *path, int flags)
 {
-    if (at_plain(dirfd, path)) return (flags & G_AT_REMOVEDIR) ? b_rmdir(path) : b_unlink(path);
-    TL_ERRNO_BEGIN(); int r = unlinkat(dirfd, path, (flags & G_AT_REMOVEDIR) ? AT_REMOVEDIR : 0); TL_ERRNO_END();
-    return r;
+    char b[PATH_MAX]; const char *p = tl_path_at(dirfd, path, b, sizeof(b));
+    if (!p) return -1;
+    return (flags & G_AT_REMOVEDIR) ? b_rmdir(p) : b_unlink(p);
 }
 static int b_fchmodat(int dirfd, const char *path, unsigned mode, int flags)
 {
     (void)flags;
-    if (at_plain(dirfd, path)) return b_chmod(path, mode);
-    TL_ERRNO_BEGIN(); int r = fchmodat(dirfd, path, (mode_t)mode, 0); TL_ERRNO_END();
-    return r;
+    char b[PATH_MAX]; const char *p = tl_path_at(dirfd, path, b, sizeof(b));
+    return p ? b_chmod(p, mode) : -1;
 }
 static int b_fchown(int fd, unsigned u, unsigned g) { TL_ERRNO_BEGIN(); int r = fchown(fd, u, g); TL_ERRNO_END(); return r; }
-static int b_chdir(const char *p) { char b[1024]; TL_ERRNO_BEGIN(); int r = chdir(tl_path_resolve(p, b, sizeof(b))); TL_ERRNO_END(); return r; }
+static int b_chdir(const char *p) { return tl_path_chdir(p); }
 static int b_utimensat(int dirfd, const char *path, const struct timespec ts[2], int flags)
 {
     struct timespec d[2];
@@ -952,10 +949,11 @@ static int b_utimensat(int dirfd, const char *path, const struct timespec ts[2],
         if (ts[i].tv_nsec == 0x3fffffff) d[i].tv_nsec = UTIME_NOW;            /* Linux UTIME_NOW  */
         else if (ts[i].tv_nsec == 0x3ffffffe) d[i].tv_nsec = UTIME_OMIT;      /* Linux UTIME_OMIT */
     }
-    char b[1024];
+    char a[PATH_MAX]; const char *p = tl_path_at(dirfd, path, a, sizeof(a));
+    if (!p) return -1;
+    CONFINE(b, p, TL_PATH_WRITE | ((flags & G_AT_SYMLINK_NOFOLLOW) ? TL_PATH_NOFOLLOW : 0), -1);
     TL_ERRNO_BEGIN();
-    int r = utimensat(at_plain(dirfd, path) ? AT_FDCWD : dirfd, at_plain(dirfd, path) ? tl_path_resolve(path, b, sizeof(b)) : path, ts ? d : NULL,
-                      (flags & G_AT_SYMLINK_NOFOLLOW) ? AT_SYMLINK_NOFOLLOW : 0);
+    int r = utimensat(AT_FDCWD, b, ts ? d : NULL, (flags & G_AT_SYMLINK_NOFOLLOW) ? AT_SYMLINK_NOFOLLOW : 0);
     TL_ERRNO_END();
     return r;
 }
@@ -963,8 +961,9 @@ static int b_utimensat(int dirfd, const char *path, const struct timespec ts[2],
 typedef struct { uint64_t f_bsize, f_frsize, f_blocks, f_bfree, f_bavail, f_files, f_ffree, f_favail, f_fsid, f_flag, f_namemax; int32_t spare[6]; } guest_statvfs;
 static int b_statvfs(const char *p, guest_statvfs *g)
 {
-    char b[1024]; struct statfs s;
-    TL_ERRNO_BEGIN(); int r = statfs(tl_path_resolve(p, b, sizeof(b)), &s); TL_ERRNO_END();
+    struct statfs s;
+    CONFINE(b, p, TL_PATH_META, -1);
+    TL_ERRNO_BEGIN(); int r = statfs(b, &s); TL_ERRNO_END();
     if (r == 0) {
         memset(g, 0, sizeof(*g));
         g->f_bsize = (uint64_t)s.f_bsize; g->f_frsize = (uint64_t)s.f_bsize; g->f_blocks = s.f_blocks; g->f_bfree = s.f_bfree; g->f_bavail = s.f_bavail;

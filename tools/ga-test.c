@@ -5,7 +5,8 @@
  *   ga-test <apk> [seconds] [width height]
  *
  * Landscape by default (the phone's aspect). Environment: TL_JNI_TRACE=1|2, TL_VERBOSE=0..2,
- * TL_CTL=<fifo> (lines "tap X Y", "hold X Y MS", "swipe X1 Y1 X2 Y2 MS", "wait MS", "shot PNG", "quit").
+ * TL_CTL=<fifo> (lines "tap X Y", "hold X Y MS", "swipe X1 Y1 X2 Y2 MS", "wait MS", "shot PNG", "quit"),
+ * TL_PATH_UNCONFINED=1 (let the guest reach files outside its data directory and the APK).
  */
 #include <dlfcn.h>
 #include <mach/mach.h>

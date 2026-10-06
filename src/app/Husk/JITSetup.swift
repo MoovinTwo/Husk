@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 import Foundation
+import Security
 import SwiftUI
 import UIKit
 
@@ -30,24 +31,50 @@ enum JITPairingSource: String {
     case imported
 }
 
-/// The RPPairing file Built-in StikJIT authenticates with. Lives in Documents,
-/// so it is visible through Finder file sharing -- it is device-sensitive and
-/// is only ever sent to Husk's own helper process.
+/// The RPPairing file Built-in StikJIT authenticates with. It is device-sensitive and
+/// is only ever sent to Husk's own helper process, so it lives in the Keychain, on this
+/// device only, rather than as a file: Documents is visible through Finder file sharing,
+/// and Android games run their native code inside this process. Earlier builds kept it
+/// at Documents/StikJIT/pairingFile.plist; the first access moves it.
 enum JITPairingFileStore {
-    static var directory: URL {
+    private static let service = (Bundle.main.bundleIdentifier ?? "com.husk.app") + ".pairing"
+    private static let account = "pairingFile"
+    private static let sourceKey = "husk.jitPairingSource"
+
+    /// Where earlier builds kept it.
+    private static var legacyDirectory: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("StikJIT", isDirectory: true)
     }
-    static var url: URL { directory.appendingPathComponent("pairingFile.plist") }
-    static var exists: Bool { FileManager.default.fileExists(atPath: url.path) }
-    private static let sourceKey = "husk.jitPairingSource"
+    private static var legacyURL: URL { legacyDirectory.appendingPathComponent("pairingFile.plist") }
+    private static var legacyExists: Bool { FileManager.default.fileExists(atPath: legacyURL.path) }
+
+    /// Runs once, on first use, before anything reads the Keychain.
+    private static let migration: Void = migrateLegacyFile()
+
+    static var exists: Bool {
+        _ = migration
+        if (try? keychainData()) != nil { return true }      // try? folds "none" and "unreadable" into nil
+        return legacyExists
+    }
 
     static var source: JITPairingSource? {
         guard exists else { return nil }
         return UserDefaults.standard.string(forKey: sourceKey).flatMap(JITPairingSource.init(rawValue:)) ?? .imported
     }
 
-    static func data() throws -> Data { try Data(contentsOf: url) }
+    static func data() throws -> Data {
+        _ = migration
+        do {
+            if let data = try keychainData() { return data }
+        } catch where legacyExists {
+            // The Keychain cannot be read, but the file the move left behind still can.
+        }
+        // Only there when it could not be moved: then the file is the pairing.
+        if legacyExists { return try Data(contentsOf: legacyURL) }
+        throw NSError(domain: "HuskJIT", code: 11,
+                      userInfo: [NSLocalizedDescriptionKey: "Pair this device or import its pairing file first."])
+    }
 
     static func importFile(from source: URL) throws {
         let scoped = source.startAccessingSecurityScopedResource()
@@ -67,9 +94,82 @@ enum JITPairingFileStore {
                           userInfo: [NSLocalizedDescriptionKey:
                             "That is not a remote pairing file. Make one with the StikDebug pairing-file guide and try again."])
         }
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try data.write(to: url, options: .atomic)
+        _ = migration
+        try writeKeychain(data)
         UserDefaults.standard.set(source.rawValue, forKey: sourceKey)
+        // A file an earlier build left (one the move could not take) is now out of date.
+        if legacyExists { removeLegacyFile() }
+    }
+
+    // MARK: - Keychain
+
+    private static var baseQuery: [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword,
+         kSecAttrService as String: service,
+         kSecAttrAccount as String: account]
+    }
+
+    /// The stored pairing, or nil when there is none.
+    private static func keychainData() throws -> Data? {
+        var query = baseQuery
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess, let data = result as? Data else { throw keychainError(status, doing: "read") }
+        return data
+    }
+
+    /// Replaces the stored pairing in place, so a failed write leaves the old one rather than none.
+    private static func writeKeychain(_ data: Data) throws {
+        let attributes: [String: Any] = [kSecValueData as String: data,
+                                         kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly]
+        var status = SecItemUpdate(baseQuery as CFDictionary, attributes as CFDictionary)
+        if status == errSecItemNotFound {
+            status = SecItemAdd(baseQuery.merging(attributes) { $1 } as CFDictionary, nil)
+        }
+        guard status == errSecSuccess else { throw keychainError(status, doing: "save") }
+    }
+
+    private static func keychainError(_ status: OSStatus, doing verb: String) -> NSError {
+        let reason = SecCopyErrorMessageString(status, nil) as String? ?? "error \(status)"
+        return NSError(domain: NSOSStatusErrorDomain, code: Int(status),
+                       userInfo: [NSLocalizedDescriptionKey: "Husk could not \(verb) the pairing file in the Keychain: \(reason)."])
+    }
+
+    // MARK: - Moving an earlier build's file
+
+    /// Copies Documents/StikJIT/pairingFile.plist into the Keychain and deletes it, but only once
+    /// the Keychain gives the same bytes back: a pairing that cannot be moved stays where it is,
+    /// and is used from there, rather than being lost.
+    private static func migrateLegacyFile() {
+        guard legacyExists else { return }
+        do {
+            // The current build never writes the file, so one that is there is the newest pairing.
+            let data = try Data(contentsOf: legacyURL)
+            try writeKeychain(data)
+            guard try keychainData() == data else {
+                throw NSError(domain: "HuskJIT", code: 12,
+                              userInfo: [NSLocalizedDescriptionKey: "the Keychain did not give it back"])
+            }
+            removeLegacyFile()
+            HuskLog.log("jit", "pairing file moved from Documents into the Keychain")
+        } catch {
+            HuskLog.log("jit", "pairing file left in Documents: \(error.localizedDescription)")
+        }
+    }
+
+    private static func removeLegacyFile() {
+        let fm = FileManager.default
+        do {
+            try fm.removeItem(at: legacyURL)
+            if (try? fm.contentsOfDirectory(atPath: legacyDirectory.path))?.isEmpty == true {
+                try fm.removeItem(at: legacyDirectory)
+            }
+        } catch {
+            HuskLog.log("jit", "could not delete the old pairing file in Documents: \(error.localizedDescription)")
+        }
     }
 }
 

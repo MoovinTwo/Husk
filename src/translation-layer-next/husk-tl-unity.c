@@ -104,6 +104,7 @@ static void *unity_main(void *arg)
 {
     (void)arg;
     pthread_setname_np("UnityMain");
+    tl_ld_thread_attach();          /* guest code runs here for the whole game: its own thread block */
     tl_log_line("unity: UnityMain thread started");
 
     /* The jobs UnityPlayer queues for this thread, in the order it queues them. */

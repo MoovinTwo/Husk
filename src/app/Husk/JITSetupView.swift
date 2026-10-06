@@ -229,7 +229,7 @@ struct JITSetupFlow: View {
                 point(3, "Tap **Choose pairing file** and pick it.", done: jit.pairingSource == .imported)
             }
             .padding(16).huskCard()
-            Label("The pairing file stays in Husk's Documents folder and is only sent to Husk's own helper.",
+            Label("Husk keeps the pairing file in this \(device)'s Keychain and only sends it to its own helper.",
                   systemImage: "lock.fill")
                 .font(.system(size: 13)).foregroundStyle(Theme.textDim)
             if let error = jit.error { outcome(error, ok: false) }

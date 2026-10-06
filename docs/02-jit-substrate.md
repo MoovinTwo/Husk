@@ -49,8 +49,9 @@ void* BreakMarkJITMapping(size_t bytes);
 ```
 
 StikDebug attaches over the debugserver/gdb-remote protocol and runs a JavaScript
-script (`StikDebug/Scripts/universal.js`; MeloNX embeds a base64 copy, decoded here to
-`research/decoded/stikdebug_jit26_universal.js`). The script is a plain
+script ([`StikDebug/Scripts/universal.js`](https://github.com/StikDebug/StikDebug),
+AGPL-3.0; Husk ships an earlier revision as `husk-jit.js`, see
+[01-licensing.md](01-licensing.md)). The script is a plain
 breakpoint-dispatch loop:
 
 1. `vAttach;<pid hex>`

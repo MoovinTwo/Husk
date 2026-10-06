@@ -10,6 +10,8 @@
  *   TL_INIT=1      also run constructors
  *   TL_VERBOSE=2   log every unresolved import
  *   TL_SKIP=a.so,b.so   leave these out
+ *   TL_PATH_UNCONFINED=1   let constructors reach any file; otherwise they get /tmp
+ *                  (the data directory when none is set) and the APK, as on the phone
  */
 #include <signal.h>
 #include <stdarg.h>

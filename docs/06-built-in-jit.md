@@ -69,9 +69,23 @@ iPhone. Husk plays that computer for its own iPhone:
 Every pairing makes a new host key under the same identifier, so the iPhone
 replaces its earlier record for Husk and only the newest pairing file works.
 
-The pairing file is stored at `Documents/StikJIT/pairingFile.plist`, visible
-through Finder file sharing. It is device-sensitive: Husk sends it only to its
-own helper process.
+The pairing file is device-sensitive: Husk sends it only to its own helper
+process. It is kept in the Keychain as a generic password (service
+`<bundle id>.pairing`, account `pairingFile`), readable after the first unlock
+and on this device only, so it is neither visible through Finder file sharing
+nor carried to another device by a backup. Earlier builds stored it at
+`Documents/StikJIT/pairingFile.plist`; the first time Husk needs the pairing it
+copies that file into the Keychain and deletes it (and the then-empty
+`StikJIT` folder) once the Keychain gives the same bytes back. If the Keychain
+cannot be written, the file stays where it is and is used from there, and the
+log says why.
+
+The Keychain and the translation layer's path confinement
+(docs/04-translation-layer.md) are defence in depth, not a sandbox. An Android
+game's native code runs inside Husk's process: confinement keeps its file
+calls out of Documents, and the Keychain keeps the pairing out of the files a
+game could reach, but code in the process can still read Husk's memory, and
+the pairing is in memory while Husk uses it.
 
 ### The helper
 

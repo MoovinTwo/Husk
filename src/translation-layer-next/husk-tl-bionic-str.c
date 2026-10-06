@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <fnmatch.h>
 #include <getopt.h>
+#include <limits.h>
 #include <locale.h>
 #include <net/if.h>
 #include <math.h>
@@ -27,8 +28,7 @@
 
 #include "husk-tl-va.h"
 
-const char *tl_path_resolve(const char *path, char *buf, size_t n);   /* husk-tl-bionic-io.c */
-int tl_synth_open(const char *path);
+int tl_synth_open(const char *path);   /* husk-tl-bionic-io.c */
 
 /* --------------------------------------------------------------- the stdio */
 
@@ -193,11 +193,13 @@ static int b_vsscanf(const char *s, const char *fmt, tl_va_list *ap) { return tl
 
 static void *b_fopen(const char *path, const char *mode)
 {
-    char buf[1024];
-    int sfd = tl_synth_open(path);
-    if (sfd >= 0) return fdopen(sfd, mode[0] == 'r' ? "r" : "r");
+    char buf[PATH_MAX];
+    int sfd = path ? tl_synth_open(path) : -1;
+    if (sfd >= 0) return fdopen(sfd, "r");
+    /* "w", "a" and "+" all write; only a plain "r" (with or without "b", "e") reads. */
+    if (!tl_path_confine(path, mode && strpbrk(mode, "wa+") ? TL_PATH_WRITE : TL_PATH_READ, buf, sizeof(buf))) return NULL;
     TL_ERRNO_BEGIN();
-    FILE *f = fopen(tl_path_resolve(path, buf, sizeof(buf)), mode);
+    FILE *f = fopen(buf, mode);
     TL_ERRNO_END();
     return f;
 }
@@ -257,11 +259,17 @@ static int b_setvbuf(void *f, char *buf, int mode, size_t size)
     /* bionic: _IOFBF 0, _IOLBF 1, _IONBF 2; Darwin: _IOFBF 0, _IOLBF 1, _IONBF 2 -- same. */
     return setvbuf(map_stream(f), buf, mode, size);
 }
-static int b_remove(const char *p) { char buf[1024]; TL_ERRNO_BEGIN(); int r = remove(tl_path_resolve(p, buf, sizeof(buf))); TL_ERRNO_END(); return r; }
+static int b_remove(const char *p)
+{
+    char buf[PATH_MAX];
+    if (!tl_path_confine(p, TL_PATH_WRITE | TL_PATH_NOFOLLOW, buf, sizeof(buf))) return -1;
+    TL_ERRNO_BEGIN(); int r = remove(buf); TL_ERRNO_END(); return r;
+}
 static int b_rename(const char *a, const char *b)
 {
-    char x[1024], y[1024];
-    TL_ERRNO_BEGIN(); int r = rename(tl_path_resolve(a, x, sizeof(x)), tl_path_resolve(b, y, sizeof(y))); TL_ERRNO_END(); return r;
+    char x[PATH_MAX], y[PATH_MAX];
+    if (!tl_path_confine(a, TL_PATH_WRITE | TL_PATH_NOFOLLOW, x, sizeof(x)) || !tl_path_confine(b, TL_PATH_WRITE | TL_PATH_NOFOLLOW, y, sizeof(y))) return -1;
+    TL_ERRNO_BEGIN(); int r = rename(x, y); TL_ERRNO_END(); return r;
 }
 
 /* ----------------------------------------------------------- _chk variants */
