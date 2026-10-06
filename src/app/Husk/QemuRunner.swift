@@ -1192,20 +1192,27 @@ final class QemuRunner: ObservableObject {
             "-drive", "file=\(guest.userdataPath),if=none,id=vdb,node-name=huskvmstate,"
                     + "format=qcow2,discard=unmap",
 
-            // Two forwards, both on loopback so nothing outside this app can
-            // reach the guest.
+            // One forward, on loopback so nothing off the device can reach it.
             //
-            //   5555  adbd, when it is willing to talk. It usually is not: an
-            //         unprovisioned LineageOS runs adbd in trade-in mode, where
-            //         every shell is refused, and provisioning it from outside
-            //         is the problem this bridge exists to solve.
             //   5599  Husk's own bridge -- a plain nc listener started by init
             //         as u:r:shell:s0, which hands whatever is written to it to
             //         /system/bin/sh. That is the same authority adb shell has,
             //         obtained without adbd's cooperation.
+            //
+            // adbd's 5555 is not forwarded any more. Husk never talks to it (an
+            // unprovisioned LineageOS keeps adbd in trade-in mode, where every
+            // shell is refused; see GuestBridge.diagnose), so the forward only
+            // offered one more way into the guest.
+            //
+            // The 5599 shell is unauthenticated. Loopback keeps it off the
+            // network, but any process on this device that can open a socket to
+            // 127.0.0.1 -- another app, or native code an Android game runs
+            // inside Husk -- gets the guest shell without asking. Fixing that
+            // needs the guest side to authenticate (a secret Husk passes in, or a
+            // Unix socket instead of TCP), which means changing the guest image,
+            // and the build source for that image is not in this repository.
             "-device", "virtio-net-pci,netdev=net0",
-            "-netdev", "user,id=net0,hostfwd=tcp:127.0.0.1:5555-:5555,"
-                     + "hostfwd=tcp:127.0.0.1:5599-:5599",
+            "-netdev", "user,id=net0,hostfwd=tcp:127.0.0.1:5599-:5599",
             "-L", "\(Bundle.main.bundlePath)/pc-bios",
 
             // 360x640 rather than 1280x800: a quarter of the pixels.

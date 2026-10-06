@@ -14,11 +14,13 @@
 #include <sys/ucontext.h>
 #include <unistd.h>
 #include <TargetConditionals.h>
+#include <CoreFoundation/CoreFoundation.h>
 #if TARGET_OS_IPHONE
 #include <os/proc.h>
 #endif
 
 #include "husk-tl-bionic.h"
+#include "husk-tl-guest.h"
 #include "husk-tl-internal.h"
 #include "husk-tl-jni.h"
 #include "husk-tl-ld.h"
@@ -44,63 +46,137 @@ static struct {
 
 /* -------------------------------------------------------------- crash report */
 
-static int find_lib(uintptr_t bias, const char *name, const void *phdr, unsigned phnum, void *user)
+/*
+ * Where the guest's libraries are, for the crash report: each library's executable view as one range, with its name.
+ * A signal handler cannot ask the linker (or dladdr), which may be half-way through changing what it would read, so
+ * a copy is kept here: two tables, the one not being read refilled from tl_ld_iterate by the launch and heartbeat
+ * threads and then made current with one atomic store, which the handler reads with one atomic load. A refill could
+ * only overwrite the table a report is reading if two refills happened during one report; they are seconds apart.
+ * Names are the linker's own strings, which live as long as the process.
+ */
+typedef struct { uintptr_t start, end, bias; const char *name; } lib_range;   /* bias: the address of vaddr 0 */
+enum { MAX_RANGES = 128 };
+static struct { lib_range r[2][MAX_RANGES]; atomic_uint n[2]; atomic_int cur; } LR;
+
+typedef struct { lib_range *r; unsigned n; } range_fill;
+static int range_of_lib(uintptr_t bias, const char *name, const void *phdr, unsigned phnum, void *user)
 {
-    struct { uintptr_t addr; const char *name; uintptr_t off; } *r = user;
+    range_fill *f = user;
     const struct { uint32_t type, flags; uint64_t off, vaddr, paddr, filesz, memsz, align; } *p = phdr;
+    uintptr_t lo = UINTPTR_MAX, hi = 0;
     for (unsigned i = 0; i < phnum; i++)
-        if (p[i].type == 1 && r->addr >= bias + p[i].vaddr && r->addr < bias + p[i].vaddr + p[i].memsz) {
-            r->name = name; r->off = r->addr - bias;
-            return 1;
+        if (p[i].type == 1 /* PT_LOAD */) {
+            if (bias + p[i].vaddr < lo) lo = bias + p[i].vaddr;
+            if (bias + p[i].vaddr + p[i].memsz > hi) hi = bias + p[i].vaddr + p[i].memsz;
         }
+    if (lo < hi && f->n < MAX_RANGES) f->r[f->n++] = (lib_range){ lo, hi, bias, name };
     return 0;
 }
 
-static void where(char *out, size_t n, uintptr_t addr)
+static void snapshot_libraries(void)
 {
-    struct { uintptr_t addr; const char *name; uintptr_t off; } r = { addr, NULL, 0 };
-    tl_ld_iterate(find_lib, &r);
-    if (r.name) snprintf(out, n, "%s+%#lx", r.name, (unsigned long)r.off);
-    else snprintf(out, n, "%#lx", (unsigned long)addr);
+    static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;        /* between the threads that refill, not the reader */
+    pthread_mutex_lock(&m);
+    int next = !atomic_load(&LR.cur);
+    range_fill f = { LR.r[next], 0 };
+    tl_ld_iterate(range_of_lib, &f);
+    atomic_store(&LR.n[next], f.n);
+    atomic_store_explicit(&LR.cur, next, memory_order_release);
+    pthread_mutex_unlock(&m);
+}
+
+/*
+ * A report line, put together in a buffer on the stack and written with write(2): nothing a fault handler may not
+ * call. Not snprintf, which takes locale locks and may allocate; not tl_log_line, which takes a mutex the faulting
+ * thread may hold. Too long a line is cut short.
+ */
+typedef struct { char b[400]; size_t n; } rline;
+static void r_str(rline *o, const char *s) { while (s && *s && o->n < sizeof(o->b) - 1) o->b[o->n++] = *s++; }
+static void r_hex(rline *o, uint64_t v)
+{
+    char t[16]; int k = 0;
+    do { t[k++] = "0123456789abcdef"[v & 15]; v >>= 4; } while (v);
+    r_str(o, "0x");
+    while (k && o->n < sizeof(o->b) - 1) o->b[o->n++] = t[--k];
+}
+static void r_dec(rline *o, int64_t v)
+{
+    char t[20]; int k = 0;
+    uint64_t u = v < 0 ? 0 - (uint64_t)v : (uint64_t)v;
+    do { t[k++] = (char)('0' + u % 10); u /= 10; } while (u);
+    if (v < 0) r_str(o, "-");
+    while (k && o->n < sizeof(o->b) - 1) o->b[o->n++] = t[--k];
+}
+/* An address, and the library it falls in from the snapshot with its offset from the load bias (an ELF virtual address,
+ * which is what a symboliser wants): "0x1234 (libgame.so+0x234)". */
+static void r_addr(rline *o, uint64_t a, const lib_range *r, unsigned n)
+{
+    r_hex(o, a);
+    for (unsigned i = 0; i < n; i++)
+        if (a >= r[i].start && a < r[i].end) { r_str(o, " ("); r_str(o, r[i].name); r_str(o, "+"); r_hex(o, a - r[i].bias); r_str(o, ")"); break; }
+}
+static void r_flush(rline *o)
+{
+    o->b[o->n++] = '\n';
+    ssize_t ignored = write(STDERR_FILENO, o->b, o->n);
+    if (tl_log_sink_fd >= 0) ignored = write(tl_log_sink_fd, o->b, o->n);
+    (void)ignored;
+    o->n = 0;
 }
 
 static struct sigaction g_prev[32];
+static atomic_int g_reporting;
 
 /*
- * A fault in guest code ends the process, as it would on Android, but not before the log says where:
- * the guest library and offset of the faulting instruction and of the code that called it. The app's
- * own crash handling (which keeps the log file) runs after.
+ * A fault in guest code ends the process, as it would on Android, but not before the log says where: the faulting
+ * instruction, the code that called it, the frame-pointer chain and the registers, as addresses with the library
+ * each falls in, and the libraries' ranges, for symbolising afterwards. The app's own crash handling (which keeps
+ * the log file) runs after. Everything here is async-signal-safe: stack buffers, write(2), atomics, sigaction.
  */
 static void on_fatal(int sig, siginfo_t *info, void *uctx)
 {
     ucontext_t *uc = uctx;
-    char tn[40] = "", a[200], b[200], c[200];
-    pthread_getname_np(pthread_self(), tn, sizeof(tn));
-    where(a, sizeof(a), (uintptr_t)uc->uc_mcontext->__ss.__pc);
-    where(b, sizeof(b), (uintptr_t)uc->uc_mcontext->__ss.__lr);
-    where(c, sizeof(c), (uintptr_t)info->si_addr);
-    tl_log_line("=== FATAL signal %d on thread '%s': fault address %p (%s)", sig, tn, info->si_addr, c);
-    tl_log_line("    pc %s", a);
-    tl_log_line("    lr %s", b);
-    uintptr_t fp = uc->uc_mcontext->__ss.__fp;
-    for (int i = 0; i < 12 && fp && (fp & 7) == 0 && fp > 0x100000000ull; i++) {
-        uintptr_t *f = (uintptr_t *)fp;
-        char w[200];
-        where(w, sizeof(w), f[1]);
-        tl_log_line("    frame %s", w);
-        if (f[0] <= fp) break;
-        fp = f[0];
+    /* One report at a time: a second fault while reporting (another thread's, or this one's, reading a bad frame)
+     * goes straight on to the handler after this one. */
+    if (!atomic_exchange(&g_reporting, 1)) {
+        int c = atomic_load_explicit(&LR.cur, memory_order_acquire);
+        unsigned n = atomic_load(&LR.n[c]);
+        const lib_range *r = LR.r[c];
+        uint64_t pc = uc->uc_mcontext->__ss.__pc, lr = uc->uc_mcontext->__ss.__lr, sp = uc->uc_mcontext->__ss.__sp;
+        rline o = { .n = 0 };
+        r_str(&o, "=== FATAL signal "); r_dec(&o, sig); r_str(&o, ": fault address "); r_addr(&o, (uint64_t)(uintptr_t)info->si_addr, r, n); r_flush(&o);
+        r_str(&o, "    pc "); r_addr(&o, pc, r, n); r_flush(&o);
+        r_str(&o, "    lr "); r_addr(&o, lr, r, n); r_flush(&o);
+        r_str(&o, "    sp "); r_hex(&o, sp); r_str(&o, " fp "); r_hex(&o, uc->uc_mcontext->__ss.__fp); r_flush(&o);
+        /* Each frame record is {caller's fp, return address}. Only records on this stack, above sp and rising, are
+         * followed; a thread's stack here is at most 16 MiB. */
+        uintptr_t fp = uc->uc_mcontext->__ss.__fp;
+        for (int i = 0; i < 16 && fp && (fp & 7) == 0 && fp >= sp && fp - sp < (16u << 20); i++) {
+            const uintptr_t *f = (const uintptr_t *)fp;
+            r_str(&o, "    frame "); r_addr(&o, f[1], r, n); r_flush(&o);
+            if (f[0] <= fp) break;
+            fp = f[0];
+        }
+        for (int i = 0; i < 29; i += 4) {
+            r_str(&o, "   ");
+            for (int k = i; k < i + 4 && k < 29; k++) { r_str(&o, " x"); r_dec(&o, k); r_str(&o, "="); r_hex(&o, uc->uc_mcontext->__ss.__x[k]); }
+            r_flush(&o);
+        }
+        for (unsigned i = 0; i < n; i++) {
+            r_str(&o, "    lib "); r_hex(&o, r[i].start); r_str(&o, "-"); r_hex(&o, r[i].end); r_str(&o, " "); r_str(&o, r[i].name); r_flush(&o);
+        }
+        atomic_store(&g_reporting, 0);
     }
-    for (int i = 0; i < 29; i += 4)
-        tl_log_line("    x%d=%#llx x%d=%#llx x%d=%#llx x%d=%#llx", i, uc->uc_mcontext->__ss.__x[i], i + 1, uc->uc_mcontext->__ss.__x[i + 1],
-                    i + 2, i + 2 < 29 ? uc->uc_mcontext->__ss.__x[i + 2] : 0ull, i + 3, i + 3 < 29 ? uc->uc_mcontext->__ss.__x[i + 3] : 0ull);
     if (g_prev[sig].sa_flags & SA_SIGINFO) {
         if (g_prev[sig].sa_sigaction) { g_prev[sig].sa_sigaction(sig, info, uctx); return; }
     } else if (g_prev[sig].sa_handler != SIG_DFL && g_prev[sig].sa_handler != SIG_IGN && g_prev[sig].sa_handler) {
         g_prev[sig].sa_handler(sig);
         return;
     }
-    signal(sig, SIG_DFL);                       /* nobody else handles it: re-fault with the default action */
+    /* Nobody else handles it: re-fault with the default action. */
+    struct sigaction dfl = { .sa_flags = 0 };
+    dfl.sa_handler = SIG_DFL;
+    sigaction(sig, &dfl, NULL);
 }
 
 static void install_crash_reporter(void)
@@ -119,11 +195,26 @@ static void install_crash_reporter(void)
 
 /* ------------------------------------------------------------------- launch */
 
-/* exit() from the game ends the game, and the thread that asked. */
+/*
+ * exit() from the game ends the game. The thread that asked goes back to the host code that called into the guest
+ * (tl_guest_unwind jumps to its landing pad, and does not return), and nothing calls into the guest after this.
+ *
+ * A thread with no pad cannot be given back to the host that way. A thread the guest started ends, as it would
+ * have on Android. The main thread must not: ending it would take Husk down, and parking it in a wait would freeze
+ * Husk's UI. Every way the host calls the guest from the main thread is under a pad, so this is for a call nobody
+ * has found yet: the main thread is handed to its run loop for good, nested above the abandoned guest frames, which
+ * keeps the UI alive (and says the game ended) while those frames and whatever host frames lie under them are never
+ * returned to -- including the UIKit event delivery that called in, which is why it is only a last resort.
+ */
 static void guest_exit(int status)
 {
     tl_log_line("native: the game exited (%d)", status);
     atomic_store(&A.state, HUSK_UNITY_ENDED);
+    tl_guest_unwind();
+    if (pthread_main_np()) {
+        tl_log_line("native: the game exited on the main thread outside any call the host made; the thread stays in its run loop");
+        for (;;) if (CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1e9, false) == kCFRunLoopRunFinished) usleep(10000);
+    }
     pthread_exit(NULL);
 }
 
@@ -134,8 +225,12 @@ static void *heartbeat_thread(void *arg)
     (void)arg;
     pthread_setname_np("husk-unity-hb");
     unsigned long last = 0;
+    /* While the engine starts, only the crash report's copy of the library table is kept fresh, four times a second. */
+    while (atomic_load(&A.state) == HUSK_UNITY_STARTING) { snapshot_libraries(); usleep(250000); }
     for (int tick = 0;; tick++) {
+        if (atomic_load(&A.state) != HUSK_UNITY_RUNNING) return NULL;
         if (tick < 40) usleep(500000); else sleep(3);          /* twice a second for the first twenty seconds */
+        snapshot_libraries();                                  /* the game loads libraries of its own as it goes */
         unsigned long f = engine_frames();
 #if TARGET_OS_IPHONE
         tl_log_line("unity: alive: %lu frames (+%lu), %zu MiB left before jetsam", f, f - last, os_proc_available_memory() >> 20);
@@ -157,6 +252,36 @@ static void *heartbeat_thread(void *arg)
     }
 }
 
+/* The engine's start-up, which runs the game's constructors and first natives: under the launch thread's landing pad. */
+static bool start_engine(void)
+{
+    if (A.engine == ENGINE_GAMEACTIVITY) {
+        tl_ga_config cfg = {
+            .apk_path = A.apk, .data_dir = A.data, .package_name = A.package, .width = A.width, .height = A.height,
+            .metal_layer = A.layer, .angle_egl = A.angle, .angle_gles = NULL, .frame_dir = NULL, .frame_every = 0,
+        };
+        tl_log_line("gameactivity: starting %s as %s, %dx%d", A.apk, A.package, A.width, A.height);
+        tl_audio_install();
+        return tl_ga_start(&cfg) && tl_ga_run();
+    }
+    if (A.engine == ENGINE_COCOS) {
+        tl_cocos_config cfg = {
+            .apk_path = A.apk, .data_dir = A.data, .package_name = A.package, .width = A.width, .height = A.height,
+            .metal_layer = A.layer, .angle_egl = A.angle, .angle_gles = NULL, .frame_dir = NULL, .frame_every = 0,
+        };
+        tl_log_line("cocos: starting %s as %s, %dx%d", A.apk, A.package, A.width, A.height);
+        tl_audio_install();
+        tl_cocos_text_install();
+        return tl_cocos_start(&cfg) && tl_cocos_run();
+    }
+    tl_unity_config cfg = {
+        .apk_path = A.apk, .data_dir = A.data, .package_name = A.package, .width = A.width, .height = A.height,
+        .metal_layer = A.layer, .angle_egl = A.angle, .angle_gles = NULL, .frame_dir = NULL, .frame_every = 0,
+    };
+    tl_log_line("unity: starting %s as %s, %dx%d", A.apk, A.package, A.width, A.height);
+    return tl_unity_start(&cfg) && tl_unity_run();
+}
+
 static void *launch_thread(void *arg)
 {
     (void)arg;
@@ -170,41 +295,25 @@ static void *launch_thread(void *arg)
     }
     install_crash_reporter();
     tl_hle_set_ca_bundle(A.ca);
+    /* Started first, so that the crash report knows the libraries of an engine that crashes while it starts. */
+    pthread_t hb;
+    if (pthread_create(&hb, NULL, heartbeat_thread, NULL) == 0) pthread_detach(hb);
 
-    bool ok;
-    if (A.engine == ENGINE_GAMEACTIVITY) {
-        tl_ga_config cfg = {
-            .apk_path = A.apk, .data_dir = A.data, .package_name = A.package, .width = A.width, .height = A.height,
-            .metal_layer = A.layer, .angle_egl = A.angle, .angle_gles = NULL, .frame_dir = NULL, .frame_every = 0,
-        };
-        tl_log_line("gameactivity: starting %s as %s, %dx%d", A.apk, A.package, A.width, A.height);
-        tl_audio_install();
-        ok = tl_ga_start(&cfg) && tl_ga_run();
-    } else if (A.engine == ENGINE_COCOS) {
-        tl_cocos_config cfg = {
-            .apk_path = A.apk, .data_dir = A.data, .package_name = A.package, .width = A.width, .height = A.height,
-            .metal_layer = A.layer, .angle_egl = A.angle, .angle_gles = NULL, .frame_dir = NULL, .frame_every = 0,
-        };
-        tl_log_line("cocos: starting %s as %s, %dx%d", A.apk, A.package, A.width, A.height);
-        tl_audio_install();
-        tl_cocos_text_install();
-        ok = tl_cocos_start(&cfg) && tl_cocos_run();
-    } else {
-        tl_unity_config cfg = {
-            .apk_path = A.apk, .data_dir = A.data, .package_name = A.package, .width = A.width, .height = A.height,
-            .metal_layer = A.layer, .angle_egl = A.angle, .angle_gles = NULL, .frame_dir = NULL, .frame_every = 0,
-        };
-        tl_log_line("unity: starting %s as %s, %dx%d", A.apk, A.package, A.width, A.height);
-        ok = tl_unity_start(&cfg) && tl_unity_run();
+    bool ok = false;
+    TL_GUEST_CALL(ok = start_engine());
+    /* Only from STARTING: a game that exited while it started (here, or on a thread it had already started) has ENDED. */
+    int expected = HUSK_UNITY_STARTING;
+    if (tl_guest_ended()) {
+        tl_log_line("native: the game ended while it was starting");
+        return NULL;
     }
     if (!ok) {
         tl_log_line("native: the game could not be started");
-        atomic_store(&A.state, HUSK_UNITY_FAILED);
+        atomic_compare_exchange_strong(&A.state, &expected, HUSK_UNITY_FAILED);
         return NULL;
     }
-    atomic_store(&A.state, HUSK_UNITY_RUNNING);
-    pthread_t hb;
-    if (pthread_create(&hb, NULL, heartbeat_thread, NULL) == 0) pthread_detach(hb);
+    if (!atomic_compare_exchange_strong(&A.state, &expected, HUSK_UNITY_RUNNING)) return NULL;
+    snapshot_libraries();
     return NULL;
 }
 

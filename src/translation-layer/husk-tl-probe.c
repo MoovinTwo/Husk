@@ -588,7 +588,7 @@ static void check_dualmap(tl_json *j, size_t page, tl_dual_mapping *stik)
 
     uint32_t code[2] = { 0x52800540u, 0xD65F03C0u }; /* movz w0, #42; ret */
     memcpy(rw, code, sizeof(code));
-    sys_icache_invalidate(rx, sizeof(code));
+    flush_icache(rx, sizeof(code));
 
     guard_arm();
     const char *status = "fail";

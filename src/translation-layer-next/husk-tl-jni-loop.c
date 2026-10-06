@@ -219,7 +219,7 @@ static jobj *proxy_call(jobj *proxy, const char *iface, const char *name, const 
         jobj *arr2 = tl_jni_new_obj_array(C("java/lang/Object"), (uint32_t)nargs);
         for (int i = 0; i < nargs; i++) arr2->oarr.v[i] = tl_jni_ref(args[i]);
         jobj *nm = tl_jni_new_string(name);
-        jobj *r2;
+        jobj *r2 = NULL;
         /* What the native returns is a local of its frame; the caller gets a reference of its own. */
         TL_JNI_NATIVE_CALL(r2 = tl_jni_ref(pf(tl_jni_env(), tl_jni_class_object("com/unity3d/player/ReflectionHelper"), tl_jni_get_field(proxy, "handle", "J").j, nm, arr2)));
         if (tl_jni_pending()) tl_jni_clear();
@@ -233,7 +233,7 @@ static jobj *proxy_call(jobj *proxy, const char *iface, const char *name, const 
     jobj *arr = tl_jni_new_obj_array(C("java/lang/Object"), (uint32_t)nargs);
     for (int i = 0; i < nargs; i++) arr->oarr.v[i] = tl_jni_ref(args[i]);
     int64_t handle = tl_jni_get_field(proxy, "handle", "J").j;
-    jobj *r;
+    jobj *r = NULL;
     TL_JNI_NATIVE_CALL(r = tl_jni_ref(fn(tl_jni_env(), tl_jni_class_object("bitter/jnibridge/JNIBridge"), handle, icls, method, arr)));
     if (tl_jni_pending()) tl_jni_clear();
     tl_jni_unref(method);
@@ -280,7 +280,7 @@ static void *looper_thread(void *arg)
     pthread_setname_np(l->name);
     tl_ld_thread_attach();          /* the callbacks it delivers are guest code */
     pthread_mutex_lock(&l->mu);
-    while (!l->quit) {
+    while (!l->quit && !tl_guest_ended()) {
         ev *e = l->head;
         if (!e) { pthread_cond_wait(&l->cv, &l->mu); continue; }
         int64_t now = now_ns();

@@ -347,24 +347,36 @@ enum HuskLog {
         log("boot", "build       : \(version) (\(build)) \(commit) built \(built)")
         log("boot", "pid         : \(getpid())")
         log("boot", "log file    : \(logFileURL.path)")
-        // Every iOS 27 device except iPad8,11/8,12 enforces TXM, which is what makes
-        // the debugger-assisted JIT path mandatory rather than optional.
+        // Every iOS 27 device except iPad8,11/8,12 enforces TXM, and on iOS 26 the
+        // newer iPhones and iPads do, which is what makes the debugger-assisted JIT
+        // path mandatory rather than optional.
         log("boot", "TXM expected: \(Self.expectsTXM(model: model) ? "YES" : "no")")
         log("boot", "===============================================")
     }
 
+    /// Whether this device enforces TXM, by the rule StikDebug's ProcessInfo+TXM.swift
+    /// uses (docs/02-jit-substrate.md): on iOS 27 everything but iPad8,11/8,12; on iOS 26
+    /// iPhones from hardware version 14,2 and iPads from 14,5; nothing earlier.
     static func expectsTXM(model: String) -> Bool {
         if #available(iOS 27.0, *) {
             return model != "iPad8,11" && model != "iPad8,12"
         }
         if #available(iOS 26.0, *) {
-            // A14-era and newer: iPhone13,x is A14, so HW major >= 13 for phones.
-            let digits = model.drop { !$0.isNumber }.prefix { $0.isNumber }
-            if let major = Int(digits) {
-                return model.hasPrefix("iPhone") ? major >= 13 : major >= 14
-            }
+            // Compared as (major, minor), not by major alone: iPhone14,2 is the first
+            // TXM iPhone, while iPhone13,x and iPhone14,1 are not.
+            guard let version = hardwareVersion(model) else { return false }
+            if model.hasPrefix("iPhone") { return version >= (14, 2) }
+            if model.hasPrefix("iPad") { return version >= (14, 5) }
         }
         return false
+    }
+
+    /// The (major, minor) hardware version in an identifier such as "iPhone14,7",
+    /// or nil when it does not have that shape (the simulator reports "arm64").
+    static func hardwareVersion(_ model: String) -> (Int, Int)? {
+        let numbers = model.drop { !$0.isNumber }.split(separator: ",", omittingEmptySubsequences: false)
+        guard numbers.count == 2, let major = Int(numbers[0]), let minor = Int(numbers[1]) else { return nil }
+        return (major, minor)
     }
 
     /// Snapshot of process memory, the figure jetsam kills on.

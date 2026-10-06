@@ -285,7 +285,7 @@ static void *gl_main(void *arg)
 
     bool was_paused = false;
     int64_t next = now_ns();
-    while (!atomic_load(&U.stop)) {
+    while (!atomic_load(&U.stop) && !tl_guest_ended()) {
         if (atomic_load(&U.paused)) {
             if (!was_paused) { if (on_pause) TL_JNI_NATIVE_CALL(on_pause(env, cls)); was_paused = true; tl_log_line("cocos: paused"); }
             usleep(20000);
@@ -301,6 +301,7 @@ static void *gl_main(void *arg)
         drain_events();
         int64_t t0 = now_ns();
         TL_JNI_NATIVE_CALL(render(env, cls));
+        if (tl_guest_ended()) break;           /* the game exited: no frame to present, and no more calls into it */
         swapBuffers(dpy, surf);
         int64_t t1 = now_ns();
         atomic_fetch_add(&U.perf_ns, (unsigned long long)(t1 - t0));

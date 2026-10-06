@@ -437,6 +437,7 @@ struct JITSettings: View {
     @ObservedObject private var jit = JITCoordinator.shared
     @State private var autoStart = Onboarding.autoStart
     @State private var keepAttached = JITBootstrap.keepDebuggerAttached
+    @State private var jitRegionMiB = JITBootstrap.jitRegionMiB
 
     private var pairingLabel: String {
         switch jit.pairingSource {
@@ -446,11 +447,19 @@ struct JITSettings: View {
         }
     }
 
+    /// Where Built-in StikJIT's pairing comes from. Husk can only pair on the device
+    /// itself from iOS 27; before that the file has to be made on a computer.
+    private var builtInPairingNeed: String {
+        OnDevicePairing.isSupported
+            ? "a pairing file, which Husk can make itself."
+            : "a pairing file made on a computer."
+    }
+
     var body: some View {
         Form {
             Section {
                 Picker("Method", selection: $jit.method) {
-                    ForEach(JITMethod.allCases) { Text($0.title).tag($0) }
+                    ForEach(JITMethod.offered(keeping: jit.method)) { Text($0.title).tag($0) }
                 }
                 DetailRow(label: "StikDebug",
                           value: JITBootstrap.isStikDebugInstalled ? "installed" : "not found", mono: false)
@@ -466,10 +475,25 @@ struct JITSettings: View {
                 Text("Method")
             } footer: {
                 Text(jit.method == .automatic
-                     ? jit.automaticDescription + " Built-in StikJIT needs iOS 26, LocalDevVPN, and a "
-                       + "pairing file, which Husk can make itself on iOS 27."
-                     : HuskBuiltInJIT.unavailableReason ?? "Built-in StikJIT needs LocalDevVPN and a pairing "
-                       + "file, which Husk can make itself on iOS 27.")
+                     ? jit.automaticDescription + " Built-in StikJIT needs iOS 26, LocalDevVPN, and "
+                       + builtInPairingNeed
+                     : HuskBuiltInJIT.unavailableReason ?? "Built-in StikJIT needs LocalDevVPN and "
+                       + builtInPairingNeed)
+            }
+
+            Section {
+                Picker("JIT memory", selection: $jitRegionMiB) {
+                    ForEach(JITBootstrap.jitRegionChoices, id: \.self) { Text("\($0) MiB").tag($0) }
+                }
+                .onChange(of: jitRegionMiB) { v in
+                    UserDefaults.standard.set(v, forKey: JITBootstrap.jitRegionKey)
+                    HuskLog.log("ui", "JIT region set to \(v) MiB from the next launch")
+                }
+            } footer: {
+                Text("512 MiB is needed for Minecraft; 256 MiB halves the setup work at each launch and is "
+                   + "enough for most Unity and cocos2d-x games. Takes effect next launch. Android also takes "
+                   + "\(QemuRunner.jitMiB) MiB from this memory, so at 256 MiB starting Android first leaves "
+                   + "none for native games until Husk is relaunched.")
             }
 
             Section {
@@ -504,10 +528,13 @@ struct JITSettings: View {
                         Label("Enable JIT with \(jit.resolvedMethod.title)", systemImage: "bolt.fill")
                     }
                     .disabled(jit.busy)
-                    Button {
-                        _ = JITBootstrap.requestTrollStoreAttach()
-                    } label: {
-                        Label("Enable JIT with TrollStore", systemImage: "sparkles")
+                    // Only where TrollStore answers: elsewhere this button could only fail.
+                    if JITMethod.trollStore.isAvailable && jit.resolvedMethod != .trollStore {
+                        Button {
+                            _ = JITBootstrap.requestTrollStoreAttach()
+                        } label: {
+                            Label("Enable JIT with TrollStore", systemImage: "sparkles")
+                        }
                     }
                 }
             } header: {

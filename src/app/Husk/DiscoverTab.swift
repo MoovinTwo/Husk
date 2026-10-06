@@ -1,8 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 import SwiftUI
 
 struct DiscoverTab: View {
     @ObservedObject private var manager = SourceManager.shared
     @ObservedObject private var host = AndroidHost.shared
+    /// Brings the Android screen to the front once an app has been launched.
+    let onOpenGuest: () -> Void
 
     @State private var showingSources = false
     @State private var showingAddSource = false
@@ -157,15 +160,28 @@ struct DiscoverTab: View {
         .cornerRadius(16)
     }
 
+    private var iconPlaceholder: some View {
+        Image(systemName: "app.dashed").font(.title).foregroundStyle(Theme.textDim)
+    }
+
     private func appRow(_ app: SourceApp) -> some View {
         HStack(spacing: 16) {
-            AsyncImage(url: URL(string: app.iconURL)) { phase in
-                if let image = phase.image {
-                    image.resizable().aspectRatio(contentMode: .fit)
-                } else if phase.error != nil {
-                    Image(systemName: "app.dashed").font(.title).foregroundStyle(Theme.textDim)
+            // An app with no icon URL gets the same placeholder as an icon that
+            // failed to load. It is drawn directly rather than by handing
+            // AsyncImage a nil URL, which would leave a spinner up instead.
+            Group {
+                if let icon = app.iconURL.flatMap(URL.init(string:)) {
+                    AsyncImage(url: icon) { phase in
+                        if let image = phase.image {
+                            image.resizable().aspectRatio(contentMode: .fit)
+                        } else if phase.error != nil {
+                            iconPlaceholder
+                        } else {
+                            ProgressView()
+                        }
+                    }
                 } else {
-                    ProgressView()
+                    iconPlaceholder
                 }
             }
             .frame(width: 50, height: 50)
@@ -183,10 +199,13 @@ struct DiscoverTab: View {
             let progress = manager.downloadProgress[app.bundleIdentifier]
 
             if isInstalled {
+                // The Library's launch path: it starts whatever activity the app declares for
+                // the launcher (not every app's is <package>.MainActivity), runs the shell call
+                // off the main thread, and then brings Android to the front.
                 Button("OPEN") {
-                    let intent = "am start -n \(app.bundleIdentifier)/\(app.bundleIdentifier).MainActivity"
-                    _ = try? GuestBridge.shared.shell(intent, timeout: 5)
+                    host.launch(app.bundleIdentifier) { onOpenGuest() }
                 }
+                .disabled(!host.isReady || host.busy != nil)
                 .font(.subheadline.bold())
                 .padding(.horizontal, 16).padding(.vertical, 8)
                 .background(Theme.surfaceHigh).foregroundStyle(Theme.text)

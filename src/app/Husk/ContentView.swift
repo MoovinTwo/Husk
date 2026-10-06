@@ -40,7 +40,7 @@ struct ContentView: View {
             // Android is then a matter of hiding what is over it, which is also
             // why it appears instantly rather than reloading.
             TabView(selection: $router.tab) {
-                DiscoverTab()
+                DiscoverTab(onOpenGuest: { showGuestScreen = true })
                     .tabItem { Label("Discover", systemImage: "sparkle.magnifyingglass") }
                     .tag(HuskTab.discover)
 

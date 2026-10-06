@@ -282,7 +282,7 @@ static bool load_native_library(const char *base)
     if (first) {
         int32_t (*onload)(void *vm, void *reserved) = (int32_t (*)(void *, void *))tl_ld_sym(L, "JNI_OnLoad");
         if (onload) {
-            int32_t ver;
+            int32_t ver = 0;
             TL_JNI_NATIVE_CALL(ver = onload(tl_jni_vm(), NULL));
             tl_log_line("jni: %s JNI_OnLoad -> %#x", base, ver);
         }

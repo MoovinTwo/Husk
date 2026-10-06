@@ -37,6 +37,15 @@ final class TLUnityUIView: UIView, UIKeyInput {
     private let stats = UILabel()
     private var statsTimer: Timer?
 
+    /// What the view says instead of a black screen when it has no game to show: another game already ran in this
+    /// launch, or this one ended or could not start. An engine cannot be unloaded, so every one of these ends the same
+    /// way -- Husk has to be restarted -- and the view says so rather than staying silently black.
+    private let notice = UIView()
+    private let noticeTitle = UILabel()
+    private let noticeDetail = UILabel()
+    /// This view started (or is showing) the game the runtime has loaded, so its end is this view's to report.
+    private var ownsGame = false
+
     init(apk: String, dataDir: String, engine: TLNativeEngine) {
         self.apk = apk
         self.dataDir = dataDir
@@ -63,6 +72,7 @@ final class TLUnityUIView: UIView, UIKeyInput {
         stats.isUserInteractionEnabled = false
         stats.text = " "
         if engine == .unity { addSubview(stats) }
+        setUpNotice()
         if engine == .cocos {
             TLUnityUIView.cocosView = self
             TLUnityUIView.installKeyboardHandler()
@@ -78,7 +88,67 @@ final class TLUnityUIView: UIView, UIKeyInput {
 
     deinit { statsTimer?.invalidate(); NotificationCenter.default.removeObserver(self) }
 
+    private func setUpNotice() {
+        notice.backgroundColor = UIColor.black.withAlphaComponent(0.8)
+        notice.isHidden = true
+        notice.isUserInteractionEnabled = false
+        notice.translatesAutoresizingMaskIntoConstraints = false
+        noticeTitle.font = .systemFont(ofSize: 16, weight: .semibold)
+        noticeTitle.textColor = .white
+        noticeDetail.font = .systemFont(ofSize: 13)
+        noticeDetail.textColor = UIColor.white.withAlphaComponent(0.7)
+        for label in [noticeTitle, noticeDetail] {
+            label.textAlignment = .center
+            label.numberOfLines = 0
+        }
+        let column = UIStackView(arrangedSubviews: [noticeTitle, noticeDetail])
+        column.axis = .vertical
+        column.spacing = 8
+        column.alignment = .center
+        column.translatesAutoresizingMaskIntoConstraints = false
+        notice.addSubview(column)
+        addSubview(notice)
+        NSLayoutConstraint.activate([
+            notice.leadingAnchor.constraint(equalTo: leadingAnchor),
+            notice.trailingAnchor.constraint(equalTo: trailingAnchor),
+            notice.topAnchor.constraint(equalTo: topAnchor),
+            notice.bottomAnchor.constraint(equalTo: bottomAnchor),
+            column.centerXAnchor.constraint(equalTo: notice.centerXAnchor),
+            column.centerYAnchor.constraint(equalTo: notice.centerYAnchor),
+            column.widthAnchor.constraint(lessThanOrEqualToConstant: 460),
+            column.leadingAnchor.constraint(greaterThanOrEqualTo: notice.leadingAnchor, constant: 24),
+        ])
+    }
+
+    private func showNotice(_ title: String, _ detail: String) {
+        if !notice.isHidden && noticeTitle.text == title { return }
+        noticeTitle.text = title
+        noticeDetail.text = detail
+        notice.isHidden = false
+        stats.isHidden = true
+        bringSubviewToFront(notice)
+        onStats?(title)
+    }
+
+    private func showEnded() {
+        showNotice("The game ended — restart Husk to play again",
+                   "A game cannot be started twice in one session. Close Husk completely and open it again.")
+    }
+
+    private func showFailed() {
+        showNotice("The game could not start — restart Husk to try again",
+                   "A game cannot be started twice in one session. The attempt log says what went wrong.")
+    }
+
     private func updateStats() {
+        // A game that exits (or never got going) leaves its last frame, or nothing, on the layer: say what happened.
+        if ownsGame {
+            switch husk_unity_state() {
+            case Int32(HUSK_UNITY_ENDED): showEnded(); return
+            case Int32(HUSK_UNITY_FAILED): showFailed(); return
+            default: break
+            }
+        }
         var p = husk_unity_perf()
         husk_unity_perf_snapshot(&p)
         let text = p.fps > 0
@@ -123,9 +193,24 @@ final class TLUnityUIView: UIView, UIKeyInput {
         let ca = Bundle.main.path(forResource: "cacert", ofType: "pem") ?? ""
         try? FileManager.default.createDirectory(atPath: dataDir, withIntermediateDirectories: true)
         let layerPtr = Unmanaged.passUnretained(layer).toOpaque()
-        if husk_unity_state() != Int32(HUSK_UNITY_IDLE) {
-            // Already started this run: the engine cannot be loaded twice, so just show it again.
-            HuskLog.log("tl", "unity: already started; resuming")
+        let state = husk_unity_state()
+        if state != Int32(HUSK_UNITY_IDLE) {
+            // One game per launch: an engine cannot be unloaded, nor loaded twice.
+            let loaded = husk_native_loaded_apk().map { String(cString: $0) }
+            if let loaded, loaded != apk {
+                HuskLog.log("tl", "native: \((loaded as NSString).lastPathComponent) already ran in this session; not launching \(apk)")
+                showNotice("Restart Husk to open another game",
+                           "\((loaded as NSString).lastPathComponent) was started in this session, and a game cannot be unloaded once it has started. Close Husk completely and open it again to play this one.")
+                return
+            }
+            ownsGame = true
+            switch state {
+            case Int32(HUSK_UNITY_ENDED): showEnded()
+            case Int32(HUSK_UNITY_FAILED): showFailed()
+            default:
+                // Already started this run: the engine cannot be loaded twice, so just show it again.
+                HuskLog.log("tl", "unity: already started; resuming")
+            }
             return
         }
         // The other half of ContentView.start()'s check: QEMU and a native game
@@ -133,6 +218,8 @@ final class TLUnityUIView: UIView, UIKeyInput {
         if QemuRunner.shared.isRunning {
             HuskLog.log("jit", "native: refusing to launch \(apk) while QEMU is running; "
                              + "restart Husk to play it")
+            showNotice("Restart Husk to open this game",
+                       "QEMU is running in this session, and a native game cannot share a launch with it.")
             return
         }
         if engine != .unity {
@@ -148,7 +235,12 @@ final class TLUnityUIView: UIView, UIKeyInput {
         case .minecraft: started = husk_gameactivity_launch(apk, dataDir, layerPtr, Int32(width), Int32(height), angle, ca)
         case .unity: started = husk_unity_launch(apk, dataDir, layerPtr, Int32(width), Int32(height), angle, ca)
         }
-        if !started { HuskLog.log("tl", "native: launch refused") }
+        if started {
+            ownsGame = true
+        } else {
+            HuskLog.log("tl", "native: launch refused")
+            showFailed()
+        }
     }
 
     // MARK: keyboard (cocos2d-x games)

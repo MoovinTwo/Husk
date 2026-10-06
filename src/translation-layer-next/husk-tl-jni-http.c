@@ -116,11 +116,11 @@ static void UWR_run(tl_jcall *c)
     uint8_t *chunk = malloc(CHUNK), *body = NULL; size_t body_len = 0;
     jobj *buf = direct_buffer(chunk, (int64_t)CHUNK);
     /* Each callback is a native call of its own, with its own locals: the strings made for it go with it. */
-    int more;
+    int more = 0;
     TL_JNI_NATIVE_CALL(more = upload(env, cls, u->ptr, NULL));
     if (more > 0) {
         for (;;) {
-            int n;
+            int n = 0;
             TL_JNI_NATIVE_CALL(n = upload(env, cls, u->ptr, buf));
             if (n <= 0) break;
             body = realloc(body, body_len + (size_t)n);
@@ -153,7 +153,7 @@ static void UWR_run(tl_jcall *c)
         for (size_t off = 0; off < rs.body_len;) {
             size_t n = rs.body_len - off < CHUNK ? rs.body_len - off : CHUNK;
             memcpy(chunk, rs.body + off, n);
-            uint8_t go;
+            uint8_t go = 0;
             TL_JNI_NATIVE_CALL(go = download(env, cls, u->ptr, buf, (int)n));
             if (!go) break;
             off += n;

@@ -87,8 +87,9 @@ void tl_jni_unref(jobj *o)
         break;
     default: break;
     }
-    for (uint32_t i = 0; i < o->nfields && i < 64; i++) if (o->refslots >> i & 1) tl_jni_unref(o->fields[i].l);
+    for (uint32_t i = 0; i < o->nfields; i++) if (o->refslots[i / 64] >> (i % 64) & 1) tl_jni_unref(o->fields[i].l);
     free(o->fields);
+    free(o->refslots);
     free(o);
 }
 
@@ -162,6 +163,10 @@ void tl_jni_local_pop(void)
     if (!k) return;
     while (t_nlf >= k) lf_pop();
 }
+
+uint32_t tl_jni_local_depth(void) { return t_nlf; }
+
+void tl_jni_local_unwind(uint32_t depth) { while (t_nlf > depth) lf_pop(); }
 
 /* DetachCurrentThread: the thread's locals go. Not while a native call on it is still running, which ART refuses. */
 static void locals_detach(void)
@@ -406,9 +411,16 @@ static jvalue *field_slot(jobj *o, tl_jfield *f)
 {
     if (f->is_static) return &f->cls->statics[f->index];
     if (f->index >= o->nfields) {
-        uint32_t n = f->index + 8;
-        o->fields = realloc(o->fields, n * sizeof(jvalue));
+        /* The fields and their reference marks grow together, so every slot has a mark: one past the first 64 held
+         * an object it never released when the marks were a single word. */
+        uint32_t n = f->index + 8, words = (n + 63) / 64, had = (o->nfields + 63) / 64;
+        jvalue *fv = realloc(o->fields, n * sizeof(jvalue));
+        if (fv) o->fields = fv;
+        uint64_t *rv = fv ? realloc(o->refslots, words * sizeof(uint64_t)) : NULL;
+        if (rv) o->refslots = rv;
+        if (!fv || !rv) { tl_log_line("jni: out of memory for %u fields of a %s", n, o->cls ? o->cls->name : "?"); abort(); }
         memset(o->fields + o->nfields, 0, (n - o->nfields) * sizeof(jvalue));
+        memset(o->refslots + had, 0, (words - had) * sizeof(uint64_t));
         o->nfields = n;
     }
     return &o->fields[f->index];
@@ -416,20 +428,21 @@ static jvalue *field_slot(jobj *o, tl_jfield *f)
 
 /*
  * An object field owns its value: it takes the reference it is given (`is_obj`) and releases the one it
- * held. Two classes of one object number their fields independently, so a slot can be an object field
- * through one and a number through the other; an instance slot is therefore released only when it is
- * marked as holding a reference, which also lets the object release its fields when it goes. A slot past
- * the 64 the mark covers keeps what it is given.
+ * held. Two classes of one object number their fields independently -- a subclass's fields and its
+ * superclass's both count from 0, so the same slot can be an object field through one and a number through
+ * the other (and two fields can share storage: that numbering is a known limitation, not fixed here). An
+ * instance slot is therefore released only when it is marked as holding a reference, which also lets the
+ * object release its fields when it goes. Every slot has a mark (see field_slot).
  */
 static void store_value(jobj *o, tl_jfield *f, bool is_obj, jvalue v)
 {
     jvalue *slot = field_slot(o, f);
     jobj *old = NULL;
     if (f->is_static) old = is_obj ? slot->l : NULL;
-    else if (f->index < 64) {
-        uint64_t bit = 1ull << f->index;
-        if (o->refslots & bit) old = slot->l;
-        o->refslots = is_obj ? o->refslots | bit : o->refslots & ~bit;
+    else {
+        uint64_t *word = &o->refslots[f->index / 64], bit = 1ull << (f->index % 64);
+        if (*word & bit) old = slot->l;
+        *word = is_obj ? *word | bit : *word & ~bit;
     }
     *slot = v;
     tl_jni_unref(old);
@@ -618,7 +631,7 @@ static void jni_ExceptionDescribe(void *env)
     tl_log_line("jni: pending exception %s: %s", t_pending->cls->name, tl_jni_string(m.l) ? tl_jni_string(m.l) : "");
 }
 static void jni_ExceptionClear(void *env) { (void)env; tl_jni_clear(); }
-static void jni_FatalError(void *env, const char *msg) { (void)env; tl_log_line("jni: FatalError: %s", msg); abort(); }
+static void jni_FatalError(void *env, const char *msg) { (void)env; tl_log_line("jni: FatalError: %s", msg); tl_guest_abort_at("JNI FatalError", __builtin_return_address(0)); }
 static int32_t jni_PushLocalFrame(void *env, int32_t cap) { (void)env; lf_push(LF_GUEST, cap > 0 ? (uint32_t)cap : 0); return 0; }
 static jo jni_PopLocalFrame(void *env, jo r)
 {

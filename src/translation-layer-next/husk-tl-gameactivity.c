@@ -160,7 +160,7 @@ static void *ui_main(void *arg)
     TL_JNI_NATIVE_CALL(G.handle = init(env, activity, tl_jni_local(tl_jni_new_string(files)), tl_jni_local(tl_jni_new_string(obb)), tl_jni_local(tl_jni_new_string(ext)),
                                        tl_hle_assets(), NULL, tl_hle_config()));
     tl_log_line("minecraft: initializeNativeCode -> %#llx", (unsigned long long)G.handle);
-    if (!G.handle || tl_jni_pending()) { tl_log_line("minecraft: the game's native code did not initialise"); return NULL; }
+    if (tl_guest_ended() || !G.handle || tl_jni_pending()) { tl_log_line("minecraft: the game's native code did not initialise"); return NULL; }
 
     typedef void (*set_input_fn)(void *env, void *self, int64_t h, void *conn);
     set_input_fn set_input = (set_input_fn)GA_NATIVE("setInputConnectionNative", "(JLcom/google/androidgamesdk/gametextinput/InputConnection;)V");
@@ -196,7 +196,7 @@ static void *ui_main(void *arg)
     /* The message loop: the looper serves what the game's native glue registered on it (its main-work pipe), and
      * the jobs posted with tl_ga_post run in between. */
     int (*poll_once)(int, int *, int *, void **) = tl_bionic_find("ALooper_pollOnce");
-    for (;;) {
+    while (!tl_guest_ended()) {
         /* On Android this is MessageQueue.nativePollOnce, a native method: what the callbacks it runs leave as locals goes when it returns. */
         TL_JNI_NATIVE_CALL(poll_once(50, NULL, NULL, NULL));
         for (;;) {

@@ -76,13 +76,18 @@ struct tl_lib {
 
     uint8_t *stub_rx, *stub_rw;    /* pages after the image: stubs for rewritten `svc` and x18 sites */
     size_t stub_used, stub_cap, nstub;
-    uint8_t *isl_rx, *isl_rw;      /* a second pool of stubs inside the image: the dead tail of the relocation table, for sites too far from the stub pages */
+    uint8_t *pre_rx, *pre_rw;      /* pages before the image: the stubs of sites too far from the pages after it */
+    size_t pre_used, pre_cap, npre;
+    uint8_t *isl_rx, *isl_rw;      /* a third pool inside the image: the dead tail of the relocation table, for sites out of range of both */
     size_t isl_used, isl_cap;
+    size_t xmem_bytes;             /* executable memory taken for it, pools included: the region never takes it back */
 
-    struct { uint64_t start, end; } code[16];   /* executable sections, as vaddrs: the only places instructions are patched */
+    struct tl_code_range { uint64_t start, end; } *code;   /* executable sections, as vaddrs: the only places instructions are patched */
     int ncode;
+    struct tl_ifunc { uint32_t sym; uint64_t value; } *ifuncs;   /* what dlsym's IFUNCs resolved to, by symbol index (under G.lock) */
+    size_t nifuncs, capifuncs;
     size_t n_ctr;                  /* reads of CTR_EL0 replaced by a constant */
-    size_t n_svc_far, n_adr_failed;   /* svc sites with no stub in branch range (answered ENOSYS), adr sites that could not be rewritten */
+    size_t n_svc_far, n_adr_failed;   /* svc sites with no pool in branch range (answered ENOSYS), adr sites that could not be rewritten */
     size_t n_x18, n_x18_failed;    /* sites rewritten for the reserved register, and sites that could not be */
     size_t n_tpidr_shared;         /* reads of TPIDR_EL0 with no stub in range, given the shared thread block */
     /* ELF TLS: the PT_TLS segment, and where its block sits from every thread's TP; tls_id 0 = none */
@@ -305,15 +310,52 @@ static void *lookup_for(tl_lib *L, const char *name, bool *weak_hit)
     return tl_bionic_find(name);
 }
 
+static uint64_t run_ifunc_resolver(const void *fn);
+
+/*
+ * A defined symbol's address as dlsym gives it. An IFUNC's is not its own value -- that is the resolver -- but what the
+ * resolver picks, as bionic's dlsym answers (soinfo::resolve_symbol_address). The resolver runs the way R_IRELATIVE
+ * runs it, once per symbol: the answer is kept, so a symbol asked for every frame does not run guest code every frame.
+ * It runs without the lock, so a resolver that itself asks dlsym cannot deadlock; two threads asking at once may
+ * both run it, and the first answer kept is the one both are given.
+ */
+static void *sym_export(tl_lib *L, const elf_sym *s)
+{
+    if ((s->st_info & 0xf) != STT_GNU_IFUNC_) return sym_value(L, s);
+    if (L->state < 2) {
+        tl_log_line("ld: %s: IFUNC %s asked for before the library is relocated; its resolver cannot run yet", L->name, sym_name(L, s));
+        return NULL;
+    }
+    uint32_t idx = (uint32_t)(s - sym_at(L, 0));
+    pthread_mutex_lock(&G.lock);
+    for (size_t i = 0; i < L->nifuncs; i++) {
+        if (L->ifuncs[i].sym == idx) { uint64_t v = L->ifuncs[i].value; pthread_mutex_unlock(&G.lock); return (void *)(uintptr_t)v; }
+    }
+    pthread_mutex_unlock(&G.lock);
+    uint64_t v = run_ifunc_resolver(L->rx + (s->st_value - L->base_vaddr));
+    pthread_mutex_lock(&G.lock);
+    for (size_t i = 0; i < L->nifuncs; i++) {
+        if (L->ifuncs[i].sym == idx) { v = L->ifuncs[i].value; pthread_mutex_unlock(&G.lock); return (void *)(uintptr_t)v; }
+    }
+    if (L->nifuncs == L->capifuncs) {
+        size_t cap = L->capifuncs ? L->capifuncs * 2 : 8;
+        struct tl_ifunc *n = realloc(L->ifuncs, cap * sizeof(*n));
+        if (n) { L->ifuncs = n; L->capifuncs = cap; }
+    }
+    if (L->nifuncs < L->capifuncs) L->ifuncs[L->nifuncs++] = (struct tl_ifunc){ idx, v };   /* else not kept: asked again next time */
+    pthread_mutex_unlock(&G.lock);
+    return (void *)(uintptr_t)v;
+}
+
 void *tl_ld_sym(tl_lib *lib, const char *name)
 {
     if (lib) {
         const elf_sym *s = lib_find(lib, name);
-        return s ? sym_value(lib, s) : NULL;
+        return s ? sym_export(lib, s) : NULL;
     }
     for (int i = 0; i < G.nlibs; i++) {
         const elf_sym *s = lib_find(G.libs[i], name);
-        if (s) return sym_value(G.libs[i], s);
+        if (s) return sym_export(G.libs[i], s);
     }
     return NULL;
 }
@@ -554,6 +596,16 @@ bool tl_ld_probe(tl_lib *L, uint64_t vaddr, void (*cb)(uint64_t *regs))
     return true;
 }
 
+static bool in_range_b(const uint8_t *from, const uint8_t *to)
+{
+    int64_t o = ((int64_t)to - (int64_t)from) / 4;
+    return o > -(1 << 25) && o < (1 << 25);
+}
+static inline uint32_t e_b(const uint8_t *from, const uint8_t *to)
+{
+    return 0x14000000u | ((uint32_t)(((int64_t)to - (int64_t)from) / 4) & 0x3FFFFFFu);
+}
+
 static bool stub_in_range(const uint8_t *site, const uint8_t *stub)
 {
     int64_t to = ((int64_t)stub - (int64_t)site) / 4;
@@ -561,23 +613,38 @@ static bool stub_in_range(const uint8_t *site, const uint8_t *stub)
 }
 
 /*
- * A 32-byte slot for a site, as writable and executable addresses, from whichever of the library's two stub pools is
- * within branch range of the site (a branch reaches 128 MiB, and Minecraft's code spans 220 MiB). `*lit` is the
- * pool's literal slot, which holds the address of the shared handler.
+ * Where the next `size` bytes of stub for the site at site_rx can go, without taking them: the first of the library's
+ * pools with room whose next slot the site reaches with a branch, and from whose end the stub can branch back. A branch
+ * reaches 128 MiB and Minecraft's code spans 220 MiB, so there are three pools: the pages after the image (any site
+ * near its end), the pages before it (sized at map time for every site the pages after cannot reach), and the dead tail
+ * of a large relocation table inside the image (see relocate) for whatever an image too big for both leaves between.
+ * `*used` is the pool's counter, for the caller to advance once the stub is written.
  */
-static bool stub_slot(tl_lib *L, const uint8_t *site_rx, uint8_t **rx, uint8_t **rw, const uint8_t **lit)
+static bool stub_find(tl_lib *L, const uint8_t *site_rx, size_t size, uint8_t **rx, uint8_t **rw, size_t **used)
 {
-    if (L->stub_used + 32 <= L->stub_cap && stub_in_range(site_rx, L->stub_rx + L->stub_used)) {
-        *rx = L->stub_rx + L->stub_used; *rw = L->stub_rw + L->stub_used; *lit = L->stub_rx;
-        L->stub_used += 32;
-        return true;
-    }
-    if (L->isl_used + 32 <= L->isl_cap && stub_in_range(site_rx, L->isl_rx + L->isl_used)) {
-        *rx = L->isl_rx + L->isl_used; *rw = L->isl_rw + L->isl_used; *lit = L->isl_rx;
-        L->isl_used += 32;
+    struct { uint8_t *rx, *rw; size_t *used, cap; } pools[3] = {
+        { L->stub_rx, L->stub_rw, &L->stub_used, L->stub_cap },
+        { L->pre_rx, L->pre_rw, &L->pre_used, L->pre_cap },
+        { L->isl_rx, L->isl_rw, &L->isl_used, L->isl_cap },
+    };
+    for (int i = 0; i < 3; i++) {
+        size_t u = *pools[i].used;
+        if (!pools[i].rx || u + size > pools[i].cap) continue;
+        uint8_t *at_rx = pools[i].rx + u;
+        if (!stub_in_range(site_rx, at_rx) || !stub_in_range(at_rx + size, site_rx + 4)) continue;
+        *rx = at_rx; *rw = pools[i].rw + u; *used = pools[i].used;
         return true;
     }
     return false;
+}
+
+/* A slot for a site, as writable and executable addresses, taken from whichever pool stub_find picks. */
+static bool stub_slot(tl_lib *L, const uint8_t *site_rx, size_t size, uint8_t **rx, uint8_t **rw)
+{
+    size_t *used;
+    if (!stub_find(L, site_rx, size, rx, rw, &used)) return false;
+    *used += size;
+    return true;
 }
 
 /*
@@ -588,8 +655,8 @@ static bool stub_slot(tl_lib *L, const uint8_t *site_rx, uint8_t **rx, uint8_t *
  */
 static bool adr_stub(tl_lib *L, const uint8_t *site_rx, uint32_t rd, uint64_t target, uint32_t *branch)
 {
-    uint8_t *rx, *rw; const uint8_t *lit;
-    if (!stub_slot(L, site_rx, &rx, &rw, &lit)) return false;
+    uint8_t *rx, *rw;
+    if (!stub_slot(L, site_rx, 32, &rx, &rw)) return false;
     int64_t to = ((int64_t)rx - (int64_t)site_rx) / 4;
     int64_t back = ((int64_t)(site_rx + 4) - (int64_t)(rx + 16)) / 4;
     uint32_t code[8] = {
@@ -605,24 +672,28 @@ static bool adr_stub(tl_lib *L, const uint8_t *site_rx, uint32_t rd, uint64_t ta
     return true;
 }
 
-/* A 32-byte stub for the `svc` at site_rx; returns its executable address, or NULL when no pool has room within range. */
+/*
+ * A stub for the `svc` at site_rx; returns its executable address, or NULL when no pool has room within range. The
+ * handler's address is the stub's own literal: a pool can be megabytes long, and `ldr` (literal) reaches only one.
+ */
+#define SVC_STUB_BYTES 40
 static uint8_t *svc_stub(tl_lib *L, const uint8_t *site_rx)
 {
-    uint8_t *rx, *rw; const uint8_t *lit;
-    if (!stub_slot(L, site_rx, &rx, &rw, &lit)) return NULL;
-    uint32_t imm19 = (uint32_t)(((int64_t)lit - (int64_t)(rx + 8)) / 4) & 0x7FFFFu;
-    int64_t back = ((int64_t)(site_rx + 4) - (int64_t)(rx + 24)) / 4;
+    uint8_t *rx, *rw;
+    if (!stub_slot(L, site_rx, SVC_STUB_BYTES, &rx, &rw)) return NULL;
     uint32_t code[8] = {
         0xA9BF7BFDu,                    /* stp x29, x30, [sp, #-16]! */
         0xA9BF47F0u,                    /* stp x16, x17, [sp, #-16]! */
-        0x58000010u | (imm19 << 5),     /* ldr x16, <the tl_svc_common literal at the page start> */
+        0x580000D0u,                    /* ldr x16, +24  (the literal at +32) */
         0xD63F0200u,                    /* blr x16 */
         0xA8C147F0u,                    /* ldp x16, x17, [sp], #16 */
         0xA8C17BFDu,                    /* ldp x29, x30, [sp], #16 */
-        0x14000000u | ((uint32_t)back & 0x3FFFFFFu),   /* b site+4 */
+        e_b(rx + 24, site_rx + 4),      /* b site+4 */
         0xD503201Fu,                    /* nop */
     };
+    uint64_t h = (uint64_t)(uintptr_t)tl_svc_common;
     memcpy(rw, code, 32);
+    memcpy(rw + 32, &h, 8);
     return rx;
 }
 
@@ -735,16 +806,6 @@ static int e_mov64(uint32_t *out, unsigned rd, uint64_t v)
     return n;
 }
 
-static bool in_range_b(const uint8_t *from, const uint8_t *to)
-{
-    int64_t o = ((int64_t)to - (int64_t)from) / 4;
-    return o > -(1 << 25) && o < (1 << 25);
-}
-static inline uint32_t e_b(const uint8_t *from, const uint8_t *to)
-{
-    return 0x14000000u | ((uint32_t)(((int64_t)to - (int64_t)from) / 4) & 0x3FFFFFFu);
-}
-
 static unsigned pick_scratch(uint32_t used, unsigned avoid)
 {
     static const unsigned order[] = { 16, 17, 15, 14, 13, 12, 11, 10, 9 };
@@ -767,9 +828,9 @@ static int x18_rewrite(tl_lib *L, uint32_t *site_rw, const uint8_t *pc, ptrdiff_
         if (G.verbosity >= 2) tl_log_line("ld: %s: unrecognised instruction %08x at +%#llx looks like it uses x18", L->name, insn, (unsigned long long)(pc - L->rx));
         return X18_FAILED;
     }
-    if (g_vx18_off < 0 || L->stub_used + X18_STUB_BYTES > L->stub_cap) return X18_FAILED;
+    uint8_t *rx, *rw; size_t *pool_used;
+    if (g_vx18_off < 0 || !stub_find(L, pc, X18_STUB_BYTES, &rx, &rw, &pool_used)) return X18_FAILED;
 
-    uint8_t *rx = L->stub_rx + L->stub_used, *rw = L->stub_rw + L->stub_used;
     uint32_t c[X18_STUB_BYTES / 4];
     int n = 0;
     const uint8_t *back = pc + 4;
@@ -839,10 +900,9 @@ static int x18_rewrite(tl_lib *L, uint32_t *site_rw, const uint8_t *pc, ptrdiff_
     }
 #undef EMIT
 #undef EMIT_B
-    if (!in_range_b(pc, rx)) return X18_FAILED;
     memcpy(rw, c, (size_t)n * 4);
     for (int i = n; i < X18_STUB_BYTES / 4; i++) ((uint32_t *)rw)[i] = 0xD503201Fu;
-    L->stub_used += X18_STUB_BYTES;
+    *pool_used += X18_STUB_BYTES;      /* taken only now: a site that fails above leaves the slot to the next */
     *site_rw = e_b(pc, rx);
     return X18_DONE;
 }
@@ -1128,8 +1188,8 @@ void *tl_ld_tls_get_addr(const tl_tls_index *ti)
  */
 static bool tpidr_stub(tl_lib *L, const uint8_t *site_rx, unsigned rt, uint32_t *branch)
 {
-    uint8_t *rx, *rw; const uint8_t *lit;
-    if (T.slot < 0 || !stub_slot(L, site_rx, &rx, &rw, &lit)) return false;
+    uint8_t *rx, *rw;
+    if (T.slot < 0 || !stub_slot(L, site_rx, 32, &rx, &rw)) return false;
     uint32_t code[6] = {
         e_mrs_tsd(rt),                  /* mrs  Xt, tpidrro_el0 */
         e_and_tsd(rt),                  /* and  Xt, Xt, #~7 */
@@ -1217,9 +1277,10 @@ static void patch_image(tl_lib *L, size_t *n_tpidr, size_t *n_adrp, size_t *n_ad
                     w[i] = 0x14000000u | ((uint32_t)off & 0x3FFFFFFu);
                     (*n_svc)++;
                 } else {
-                    /* A branch reaches 128 MiB, and a big library's stubs are at its far end. Such a site gets the
-                     * answer a kernel without the call gives -- ENOSYS -- which is what the code around it (a crash
-                     * reporter's raw-syscall wrappers, in Minecraft's case) is written to cope with. */
+                    /* No pool within a branch has room: an image whose code spans more than two branch ranges with
+                     * no relocation-table tail between them, or pools sized short. Such a site gets the answer a
+                     * kernel without the call gives -- ENOSYS -- which is what the code around it (a crash reporter's
+                     * raw-syscall wrappers, in Minecraft's case) is written to cope with; relocate says how many. */
                     w[i] = 0x92800000u | (37u << 5);                /* movn x0, #37  (x0 = -ENOSYS) */
                     L->n_svc_far++;
                 }
@@ -1503,6 +1564,59 @@ static void parse_dynamic(tl_lib *L, uint64_t dyn_vaddr, uint64_t dyn_size)
     }
 }
 
+/* An executable section, or an executable segment taken whole, as the file has it. */
+typedef struct { uint64_t vaddr, size, foff; } code_sec;
+
+/*
+ * The bytes of stub the instruction `v` at `va` will be given by patch_image, judged from the file before anything is
+ * patched, in patch_image's order: a read of the thread pointer, then anything naming x18, then the rest.
+ */
+static size_t site_stub_bytes(uint32_t v, uint64_t va, uint64_t base_vaddr, size_t npages, const uint8_t *flags)
+{
+    if ((v & 0xFFFFFFE0u) == 0xD53BD040u) return 32;                                    /* mrs Xt, TPIDR_EL0 */
+    if (((v & 31u) == 18 || ((v >> 5) & 31u) == 18 || ((v >> 10) & 31u) == 18 || ((v >> 16) & 31u) == 18) && a64_uses_gpr(v, 18, NULL))
+        return X18_STUB_BYTES;
+    if (v == 0xD4000001u) return SVC_STUB_BYTES;                                        /* svc #0 */
+    if ((v & 0xFFFFFFE0u) == 0xD53B0020u) return 32;                                    /* mrs Xt, CTR_EL0 */
+    if ((v & 0x9F000000u) == 0x10000000u) {                                             /* adr: a stub if it reaches writable data */
+        int64_t imm = (int64_t)((((v >> 5) & 0x7FFFFu) << 2) | ((v >> 29) & 3u));
+        if (imm & 0x100000) imm -= 0x200000;
+        int64_t tv = (int64_t)va + imm - (int64_t)base_vaddr;
+        if (tv >= 0 && (size_t)tv < npages * PAGE && (flags[(size_t)tv / PAGE] & TL_PAGE_W)) return 32;
+    }
+    return 0;
+}
+
+/* The stub bytes needed by the sites at image offsets [lo, hi). */
+static size_t stub_bytes_in(const uint8_t *file, const code_sec *code, int ncode, uint64_t base_vaddr, size_t npages,
+                            const uint8_t *flags, uint64_t lo, uint64_t hi)
+{
+    size_t n = 0;
+    for (int r = 0; r < ncode; r++) {
+        const uint32_t *wv = (const uint32_t *)(file + code[r].foff);
+        uint64_t start = code[r].vaddr - base_vaddr;     /* map_library keeps only sections inside the image */
+        size_t cnt = (size_t)(code[r].size / 4), k = 0;
+        if (start + (uint64_t)cnt * 4 <= lo || start >= hi) continue;
+        if (start < lo) k = (size_t)((lo - start) / 4);
+        if (hi != UINT64_MAX && start + (uint64_t)cnt * 4 > hi) cnt = (size_t)((hi - start + 3) / 4);
+        for (; k < cnt; k++) {
+            uint64_t off = start + k * 4;
+            if (off >= lo && off < hi) n += site_stub_bytes(wv[k], code[r].vaddr + k * 4, base_vaddr, npages, flags);
+        }
+    }
+    return n;
+}
+
+/* How far a site may be from the far end of its stub's pool and still be reached, and reached back: a branch's 128 MiB, less a page to spare. */
+#define BRANCH_REACH (((uint64_t)128 << 20) - PAGE)
+
+/* Memory the region handed out that a library that then failed will never use. Said, because nothing else would. */
+static void xmem_lost(const char *name, size_t bytes)
+{
+    tl_log_line("ld: %s: %zu KiB of executable memory stays taken and unusable (the region is a bump allocator and cannot "
+                "take it back); %zu MiB left", name, bytes >> 10, (tl_xmem_size() - tl_xmem_used()) >> 20);
+}
+
 static tl_lib *map_library(const char *name, uint8_t *file, size_t flen)
 {
     if (G.nlibs >= MAX_LIBS) { tl_log_line("ld: too many libraries"); return NULL; }
@@ -1516,15 +1630,25 @@ static tl_lib *map_library(const char *name, uint8_t *file, size_t flen)
         tl_log_line("ld: %s: program headers run off the file", name);
         return NULL;
     }
-    tl_segment loads[16]; int nloads = 0; tl_segment relro = {0}; bool has_relro = false;
+    /* Everything below is sized from the file: a library may have any number of segments and sections. */
+    size_t nph = eh->e_phnum ? eh->e_phnum : 1;
+    bool have_sh = eh->e_shoff && eh->e_shentsize >= 64 && eh->e_shnum && eh->e_shoff + (uint64_t)eh->e_shnum * eh->e_shentsize <= flen;
+    size_t ncode_max = (have_sh && eh->e_shnum > nph) ? eh->e_shnum : nph;
+    elf_phdr *phs = malloc(nph * sizeof(elf_phdr));
+    tl_segment *loads = malloc(nph * sizeof(tl_segment));
+    code_sec *code = malloc(ncode_max * sizeof(code_sec));
+    uint8_t *flags = NULL, *base_rx = NULL, *base_rw = NULL;
+    size_t total = 0;
+    tl_lib *L = NULL;
+    if (!phs || !loads || !code) { tl_log_line("ld: %s: out of memory for its headers", name); goto fail; }
+
+    int nloads = 0; tl_segment relro = {0}; bool has_relro = false;
     uint64_t dyn_v = 0, dyn_n = 0;
     const elf_phdr *tls = NULL;
-    elf_phdr *phs = malloc((size_t)eh->e_phnum * sizeof(elf_phdr));
-    if (!phs) return NULL;
     for (unsigned i = 0; i < eh->e_phnum; i++) {
         memcpy(&phs[i], file + eh->e_phoff + (size_t)i * eh->e_phentsize, sizeof(elf_phdr));
         const elf_phdr *p = &phs[i];
-        if (p->p_type == PT_LOAD_ && nloads < 16) {
+        if (p->p_type == PT_LOAD_) {
             loads[nloads].vaddr = p->p_vaddr; loads[nloads].memsz = p->p_memsz; loads[nloads].flags = p->p_flags;
             nloads++;
         } else if (p->p_type == PT_GNU_RELRO_) {
@@ -1535,91 +1659,94 @@ static tl_lib *map_library(const char *name, uint8_t *file, size_t flen)
             tls = p;
         }
     }
-    if (!nloads || !dyn_n) { tl_log_line("ld: %s has no loadable or dynamic segments", name); free(phs); return NULL; }
+    if (!nloads || !dyn_n) { tl_log_line("ld: %s has no loadable or dynamic segments", name); goto fail; }
 
     uint64_t base_vaddr = 0;
     size_t npages = tl_page_plan(loads, (size_t)nloads, has_relro ? &relro : NULL, PAGE, NULL, 0, &base_vaddr);
-    if (!npages) { tl_log_line("ld: %s: unusable page layout", name); free(phs); return NULL; }
-    uint8_t *flags = malloc(npages);
+    if (!npages) { tl_log_line("ld: %s: unusable page layout", name); goto fail; }
+    if (!(flags = malloc(npages))) goto fail;
     tl_page_plan(loads, (size_t)nloads, has_relro ? &relro : NULL, PAGE, flags, npages, &base_vaddr);
     size_t tls_off = 0;
     if (tls && (tls->p_vaddr < base_vaddr || tls->p_vaddr - base_vaddr + tls->p_filesz > npages * PAGE)) {
         tl_log_line("ld: %s: its TLS segment is outside the image", name);
-        free(flags); free(phs);
-        return NULL;
+        goto fail;
     }
-    if (tls && !tls_reserve(name, tls, &tls_off)) { free(flags); free(phs); return NULL; }
+    if (tls && !tls_reserve(name, tls, &tls_off)) goto fail;
 
     /* The executable sections, from the section headers when the file has them (it almost always does);
      * otherwise whole executable segments, which is correct for a library with nothing but code in them. */
-    struct { uint64_t vaddr, size, foff; } code[16]; int ncode = 0;
-    if (eh->e_shoff && eh->e_shentsize >= 64 && eh->e_shnum && eh->e_shoff + (uint64_t)eh->e_shnum * eh->e_shentsize <= flen) {
-        for (unsigned i = 0; i < eh->e_shnum && ncode < 16; i++) {
+    int ncode = 0;
+    if (have_sh) {
+        for (unsigned i = 0; i < eh->e_shnum; i++) {
             const uint8_t *sh = file + eh->e_shoff + (size_t)i * eh->e_shentsize;
-            uint32_t type; uint64_t flags, addr, off, size;
-            memcpy(&type, sh + 4, 4); memcpy(&flags, sh + 8, 8); memcpy(&addr, sh + 16, 8); memcpy(&off, sh + 24, 8); memcpy(&size, sh + 32, 8);
-            if (type == 1 /* PROGBITS */ && (flags & 4 /* EXECINSTR */) && size && off + size <= flen) {
+            uint32_t type; uint64_t sflags, addr, off, size;
+            memcpy(&type, sh + 4, 4); memcpy(&sflags, sh + 8, 8); memcpy(&addr, sh + 16, 8); memcpy(&off, sh + 24, 8); memcpy(&size, sh + 32, 8);
+            /* patch_image writes over these through the image: one outside it is ignored, not trusted */
+            if (type == 1 /* PROGBITS */ && (sflags & 4 /* EXECINSTR */) && size && off <= flen && size <= flen - off
+                && addr >= base_vaddr && addr - base_vaddr <= npages * PAGE && size <= npages * PAGE - (addr - base_vaddr)) {
                 code[ncode].vaddr = addr; code[ncode].size = size; code[ncode].foff = off; ncode++;
             }
         }
     }
     if (!ncode) {
         tl_log_line("ld: %s has no section headers; treating every executable segment as code", name);
-        for (unsigned i = 0; i < eh->e_phnum && ncode < 16; i++) {
+        for (unsigned i = 0; i < eh->e_phnum; i++) {
             const elf_phdr *p = &phs[i];
-            if (p->p_type == PT_LOAD_ && (p->p_flags & PF_X_) && p->p_offset + p->p_filesz <= flen) {
+            if (p->p_type == PT_LOAD_ && (p->p_flags & PF_X_) && p->p_offset <= flen && p->p_filesz <= flen - p->p_offset
+                && p->p_vaddr >= base_vaddr && p->p_vaddr - base_vaddr + p->p_filesz <= npages * PAGE) {
                 code[ncode].vaddr = p->p_vaddr; code[ncode].size = p->p_filesz; code[ncode].foff = p->p_offset; ncode++;
             }
         }
     }
 
-    /* Stub pages after the image: one literal slot, a few probes, a stub for every raw
-     * system call and read of the thread pointer, and one for every instruction that
-     * names the reserved register x18. */
-    size_t stub_bytes = 16 + 8192;
-    for (int r = 0; r < ncode; r++) {
-        const uint32_t *wv = (const uint32_t *)(file + code[r].foff);
-        for (size_t k = 0, cnt = (size_t)(code[r].size / 4); k < cnt; k++) {
-            uint32_t v = wv[k];
-            if (v == 0xD4000001u) stub_bytes += 32;
-            else if ((v & 0xFFFFFFE0u) == 0xD53BD040u) stub_bytes += 32;                 /* mrs Xt, TPIDR_EL0 */
-            else if ((v & 0xFFFFFFE0u) == 0xD53B0020u) stub_bytes += 32;                 /* mrs Xt, CTR_EL0 */
-            else if ((v & 0x9F000000u) == 0x10000000u) {                 /* adr: a stub if it reaches writable data */
-                int64_t imm = (int64_t)((((v >> 5) & 0x7FFFFu) << 2) | ((v >> 29) & 3u));
-                if (imm & 0x100000) imm -= 0x200000;
-                int64_t tv = (int64_t)(code[r].vaddr + k * 4) + imm - (int64_t)base_vaddr;
-                if (tv >= 0 && (size_t)tv < npages * PAGE && (flags[(size_t)tv / PAGE] & TL_PAGE_W)) stub_bytes += 32;
-            }
-            else if (((v & 31u) == 18 || ((v >> 5) & 31u) == 18 || ((v >> 10) & 31u) == 18 || ((v >> 16) & 31u) == 18) && a64_uses_gpr(v, 18, NULL))
-                stub_bytes += X18_STUB_BYTES;
+    /*
+     * Stub pages after the image: one literal slot, a few probes, a stub for every raw system call, read of the thread
+     * pointer and the like, and one for every instruction that names the reserved register x18. A site more than a
+     * branch from the far end of those pages cannot use them, so when the image is that large, pages *before* it hold
+     * the stubs of the sites near its start: with both, every site of an image whose code spans up to two branch ranges
+     * (256 MiB) reaches a stub. The pages after are sized for every site, so a site that reaches them never runs short.
+     */
+    size_t stub_bytes = 16 + 8192 + stub_bytes_in(file, code, ncode, base_vaddr, npages, flags, 0, UINT64_MAX);
+    size_t nstub = (stub_bytes + PAGE - 1) / PAGE, npre = 0;
+    uint64_t span = (uint64_t)(npages + nstub) * PAGE;
+    uint64_t post_lo = span > BRANCH_REACH ? span - BRANCH_REACH : 0;      /* sites below this offset may not reach the pages after */
+    if (post_lo) {
+        size_t pre_bytes = stub_bytes_in(file, code, ncode, base_vaddr, npages, flags, 0, post_lo);
+        if (pre_bytes) {
+            npre = (pre_bytes + 8192 + PAGE - 1) / PAGE;
+            uint64_t pre_hi = (uint64_t)npre * PAGE < BRANCH_REACH ? BRANCH_REACH - (uint64_t)npre * PAGE : 0;
+            size_t gap = pre_hi < post_lo ? stub_bytes_in(file, code, ncode, base_vaddr, npages, flags, pre_hi, post_lo) : 0;
+            if (gap) tl_log_line("ld: %s: its code spans more than two branch ranges; sites needing %zu bytes of stubs between "
+                                 "+%#llx and +%#llx reach neither stub pool and depend on the relocation table's dead tail",
+                                 name, gap, (unsigned long long)pre_hi, (unsigned long long)post_lo);
         }
     }
-    size_t nstub = (stub_bytes + PAGE - 1) / PAGE;
     if (!vx18_init()) tl_log_line("ld: no thread-specific slot for the virtual x18; instructions using x18 will not be rewritten");
 
-    uint8_t *rx, *rw;
-    if (!tl_xmem_alloc((npages + nstub) * PAGE, &rx, &rw)) {
+    total = (npre + npages + nstub) * PAGE;
+    if (!tl_xmem_alloc(total, &base_rx, &base_rw)) {
         tl_log_line("ld: %s needs %zu MiB of executable memory and the region has %zu MiB left", name,
-                    npages * PAGE >> 20, (tl_xmem_size() - tl_xmem_used()) >> 20);
-        free(flags); free(phs);
-        return NULL;
+                    total >> 20, (tl_xmem_size() - tl_xmem_used()) >> 20);
+        total = 0;
+        goto fail;
     }
+    uint8_t *rx = base_rx + npre * PAGE, *rw = base_rw + npre * PAGE;
     /* The region's pages are not guaranteed zero (StikDebug writes a byte into each),
      * and .bss has to be. */
-    memset(rw, 0, (npages + nstub) * PAGE);
+    memset(base_rw, 0, total);
     for (unsigned i = 0; i < eh->e_phnum; i++) {
         const elf_phdr *p = &phs[i];
         if (p->p_type != PT_LOAD_ || !p->p_filesz) continue;
-        if (p->p_offset + p->p_filesz > flen || p->p_vaddr < base_vaddr
+        if (p->p_offset > flen || p->p_filesz > flen - p->p_offset || p->p_vaddr < base_vaddr
             || p->p_vaddr - base_vaddr + p->p_filesz > npages * PAGE) {
             tl_log_line("ld: %s: segment %u is outside the file or the image", name, i);
-            free(flags); free(phs);
-            return NULL;
+            goto fail;
         }
         memcpy(rw + (p->p_vaddr - base_vaddr), file + p->p_offset, p->p_filesz);
     }
 
-    tl_lib *L = calloc(1, sizeof(*L));
+    L = calloc(1, sizeof(*L));
+    if (!L || !(L->code = malloc((size_t)(ncode ? ncode : 1) * sizeof(*L->code)))) { tl_log_line("ld: %s: out of memory", name); goto fail; }
     snprintf(L->name, sizeof(L->name), "%s", name);
     L->rx = rx; L->rw = rw; L->base_vaddr = base_vaddr; L->npages = npages; L->pflags = flags;
     L->phdr = phs; L->phnum = eh->e_phnum;
@@ -1627,6 +1754,8 @@ static tl_lib *map_library(const char *name, uint8_t *file, size_t flen)
     L->ncode = ncode;
     L->stub_rx = rx + npages * PAGE; L->stub_rw = rw + npages * PAGE; L->stub_used = 16; L->stub_cap = nstub * PAGE; L->nstub = nstub;
     { uint64_t h = (uint64_t)(uintptr_t)tl_svc_common; memcpy(L->stub_rw, &h, 8); }
+    if (npre) { L->pre_rx = base_rx; L->pre_rw = base_rw; L->pre_cap = npre * PAGE; L->npre = npre; }
+    L->xmem_bytes = total;
     parse_dynamic(L, dyn_v, dyn_n);
     if (L->strtab) {
         const elf_dyn *d = at(L, dyn_v);
@@ -1641,8 +1770,15 @@ static tl_lib *map_library(const char *name, uint8_t *file, size_t flen)
         L->tls_vaddr = tls->p_vaddr; L->tls_filesz = tls->p_filesz; L->tls_memsz = tls->p_memsz; L->tls_off = tls_off;
         tls_register(L);
     }
+    free(loads); free(code);
     G.libs[G.nlibs++] = L;
     return L;
+
+fail:
+    if (total) xmem_lost(name, total);
+    if (L) free(L->code);
+    free(L); free(flags); free(phs); free(loads); free(code);
+    return NULL;
 }
 
 /* ------------------------------------------------------------------ loading */
@@ -1664,14 +1800,13 @@ static bool relocate(tl_lib *L)
         uint64_t end = (L->rela + L->relasz) & ~(uint64_t)(PAGE - 1), cap = 256u << 10;
         if (end - L->rela > cap + PAGE) {
             size_t off = (size_t)(end - cap - L->base_vaddr);
-            L->isl_rx = L->rx + off; L->isl_rw = L->rw + off; L->isl_cap = cap; L->isl_used = 16;
+            L->isl_rx = L->rx + off; L->isl_rw = L->rw + off; L->isl_cap = cap; L->isl_used = 0;
             memset(L->isl_rw, 0, cap);
-            uint64_t h = (uint64_t)(uintptr_t)tl_svc_common; memcpy(L->isl_rw, &h, 8);
         }
     }
     size_t t = 0, a = 0, ad = 0, sv = 0;
     patch_image(L, &t, &a, &ad, &sv);
-    tl_xmem_flush(L->rx, (L->npages + L->nstub) * PAGE);
+    tl_xmem_flush(L->rx - L->npre * PAGE, (L->npre + L->npages + L->nstub) * PAGE);
     L->state = 2;
     if (G.verbosity >= 1) {
         tl_log_line("ld: %-36s %5.1f MiB  %7zu relocs, %4zu tpidr + %5zu adrp patched%s%s", L->name,
@@ -1684,11 +1819,12 @@ static bool relocate(tl_lib *L)
         if (L->tls_id) tl_log_line("ld:   %s: %llu bytes of thread-local storage at TP+%#zx (module %zu)", L->name,
                                    (unsigned long long)L->tls_memsz, L->tls_off, L->tls_id);
         if (L->n_tpidr_shared) tl_log_line("ld:   %s: %zu reads of TPIDR_EL0 have no stub in range and see the shared thread block", L->name, L->n_tpidr_shared);
-        if (L->n_svc_far) tl_log_line("ld:   %s: %zu raw system-call sites are out of branch range of the stubs and answer ENOSYS", L->name, L->n_svc_far);
         if (sv) tl_log_line("ld:   %s: %zu raw system-call sites rewritten", L->name, sv);
         if (L->n_x18 || L->n_x18_failed) tl_log_line("ld:   %s: %zu instructions using x18 rewritten for the virtual register%s", L->name, L->n_x18,
                                                      L->n_x18_failed ? " (and some that could not be)" : "");
     }
+    /* Not a summary line: a system call that silently fails is a bug report waiting to happen, so it is said at any verbosity. */
+    if (L->n_svc_far) tl_log_line("ld: %s: %zu raw system-call sites have no stub in branch range and answer ENOSYS", L->name, L->n_svc_far);
     return true;
 }
 
@@ -1721,7 +1857,11 @@ static tl_lib *load_locked(const char *name, int depth)
         if (!load_locked(dn, depth + 1)) tl_log_line("ld: %s: needed library %s could not be loaded", name, dn);
     }
     build_scope(L);
-    if (!relocate(L)) return NULL;
+    if (!relocate(L)) {
+        /* It stays registered, half relocated, so nothing else maps over it; its memory is gone either way. */
+        xmem_lost(L->name, L->xmem_bytes);
+        return NULL;
+    }
     tls_publish(L);
     return L;
 }

@@ -21,6 +21,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "husk-tl-guest.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -46,7 +48,7 @@ struct jobj {
     };
     jvalue *fields;                     /* instance fields, indexed by tl_jfield::index */
     uint32_t nfields;
-    uint64_t refslots;                  /* which of fields[0..63] hold a reference of their own */
+    uint64_t *refslots;                 /* bit i: fields[i] holds a reference of its own; as many words as nfields needs */
     void *native;                       /* an implementation's own state */
     void *monitor;
 };
@@ -107,14 +109,20 @@ void tl_jni_clear(void);
 /*
  * Objects the JNIEnv functions return are local references, released when the native method
  * that received them returns, as on Android. TL_JNI_NATIVE_CALL runs a call into the guest's
- * native code (a native method, JNI_OnLoad, a callback) in a local frame of its own; every place
- * the host calls a native goes through it. tl_jni_local hands a reference to the innermost frame,
- * for an object the host makes only to pass to such a call.
+ * native code (a native method, JNI_OnLoad, a callback) in a local frame of its own, under a
+ * landing pad (husk-tl-guest.h) so that the game exiting inside it comes back here; every place
+ * the host calls a native goes through it, and once the game has ended it skips the call.
+ * tl_jni_local hands a reference to the innermost frame, for an object the host makes only to
+ * pass to such a call.
  */
 void tl_jni_local_push(void);
 void tl_jni_local_pop(void);                                  /* releases every local recorded since the push */
 jobj *tl_jni_local(jobj *o);                                  /* the frame takes over this reference; returns o */
-#define TL_JNI_NATIVE_CALL(...) do { tl_jni_local_push(); __VA_ARGS__; tl_jni_local_pop(); } while (0)
+/* How many frames the calling thread has, and popping back down to such a count: what a landing pad uses to
+ * release the frames of the calls it abandoned, which never reached their own pops. */
+uint32_t tl_jni_local_depth(void);
+void tl_jni_local_unwind(uint32_t depth);
+#define TL_JNI_NATIVE_CALL(...) TL_GUEST_CALL(tl_jni_local_push(); __VA_ARGS__; tl_jni_local_pop())
 
 /* ---------------------------------------------------- what libraries register */
 

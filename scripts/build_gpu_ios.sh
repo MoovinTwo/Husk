@@ -18,8 +18,20 @@ HUSK_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 GPU="$HUSK_ROOT/third_party/gpu"
 PREFIX="$HUSK_ROOT/build/ios-arm64/sysroot"
 LOGS="$HUSK_ROOT/build/logs"
-MESON=/opt/homebrew/bin/meson
-NINJA=/opt/homebrew/bin/ninja
+# Found on PATH (Homebrew, MacPorts, pip, ...); MESON=/path or NINJA=/path override.
+# (No ${var^^}: macOS ships bash 3.2.)
+find_tool () {
+    local name="$1" var="$2" override="$3" path
+    if [ -n "$override" ]; then path="$override"; else path="$(command -v "$name" || true)"; fi
+    if [ -z "$path" ] || [ ! -x "$path" ]; then
+        echo "error: $name not found${override:+ at $override}. Install it (e.g. 'brew install $name')" \
+             "or set $var=/path/to/$name." >&2
+        exit 1
+    fi
+    printf '%s\n' "$path"
+}
+MESON="$(find_tool meson MESON "${MESON:-}")"
+NINJA="$(find_tool ninja NINJA "${NINJA:-}")"
 mkdir -p "$GPU" "$LOGS"
 
 EPOXY_COMMIT=bf98587477fe68d07b93319ece7b40a7d0e2eabe
@@ -48,10 +60,10 @@ echo "==> libepoxy"
   git checkout -q -- src/dispatch_common.c 2>/dev/null || true
   patch -p1 --silent < "$HUSK_ROOT/patches/husk-epoxy-ios-egl-path.patch"
   rm -rf _build
-  $MESON setup _build --cross-file "$HUSK_ROOT/build/ios-arm64/cross-ios.meson" \
+  "$MESON" setup _build --cross-file "$HUSK_ROOT/build/ios-arm64/cross-ios.meson" \
       --prefix "$PREFIX" --default-library=static \
       -Dtests=false -Dglx=no -Degl=yes -Dx11=false
-  $NINJA -C _build install ) > "$LOGS/epoxy.log" 2>&1 \
+  "$NINJA" -C _build install ) > "$LOGS/epoxy.log" 2>&1 \
   || { echo "epoxy failed:" >&2; grep -a "error:\|FAILED:" "$LOGS/epoxy.log" | head -10 >&2; exit 1; }
 echo "    $(ls -lh "$PREFIX/lib/libepoxy.a" | awk '{print $5}')"
 
@@ -68,11 +80,11 @@ echo "==> virglrenderer (render server in thread mode)"
 # on macOS and thread mode everywhere else for exactly this reason.
 ( cd "$GPU/virgl"
   rm -rf _build
-  $MESON setup _build --cross-file "$HUSK_ROOT/build/ios-arm64/cross-ios-darwin.meson" \
+  "$MESON" setup _build --cross-file "$HUSK_ROOT/build/ios-arm64/cross-ios-darwin.meson" \
       --prefix "$PREFIX" --default-library=static \
       -Dtests=false -Dcheck-gl-errors=false -Dvenus=false -Dvulkan-dload=false \
       -Drender-server-mode=thread
-  $NINJA -C _build install ) > "$LOGS/virgl.log" 2>&1 \
+  "$NINJA" -C _build install ) > "$LOGS/virgl.log" 2>&1 \
   || { echo "virglrenderer failed:" >&2; grep -a "error:\|FAILED:\|ERROR" "$LOGS/virgl.log" | head -10 >&2; exit 1; }
 echo "    $(ls -lh "$PREFIX/lib/libvirglrenderer.a" | awk '{print $5}')"
 

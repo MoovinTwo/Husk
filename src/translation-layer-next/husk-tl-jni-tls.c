@@ -9,7 +9,7 @@
  * "NOT_TRUSTED", and the game cannot even register its player.
  *
  * iOS gives an app no way to list its root store, so the roots come from a PEM bundle
- * (Mozilla's, shipped with the app); the host harness defaults to the Mac's /etc/ssl/cert.pem.
+ * shipped with the app (a copy of macOS's root store, not Mozilla's; see scripts/update_cacert.sh); the host harness defaults to the Mac's /etc/ssl/cert.pem.
  */
 #define _DARWIN_C_SOURCE
 #include "husk-tl-jni.h"

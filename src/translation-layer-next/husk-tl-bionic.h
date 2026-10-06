@@ -54,6 +54,9 @@ extern void (*tl_guest_exit_hook)(int status);   /* set by an app host: exit() f
 /* abort(), _exit() or a fatal signal on itself from guest code: logs the caller (lr), then calls tl_guest_exit_hook
  * with status if one is set. Returns only when none is, and the caller then ends the process. */
 void tl_guest_fatal(int status, const char *what, void *lr);
+/* A check the guest failed (a fortify *_chk overflow, operator new out of memory): the caller has logged what failed;
+ * this ends the guest as abort() does (status 134), or the process when no hook is set. */
+_Noreturn void tl_guest_abort_at(const char *what, void *lr);
 
 void *tl_bionic_find(const char *name);
 bool  tl_bionic_is_system_lib(const char *soname);

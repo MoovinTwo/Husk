@@ -307,6 +307,8 @@ typedef struct {
 
     /* Dalvik / DEX execution (Milestone 2) */
     tl_dex_context *dex_ctx;
+
+    size_t jit_carved;         /* bytes this attempt took from the shared JIT region (see jit_account) */
 } tl_run;
 
 static tl_run g_run;
@@ -521,6 +523,14 @@ static bool is_valid_dual_mapping(const tl_dual_mapping *m)
  * decoding that function's machine code, both of which depend on the exact
  * build of the library and break without a word when it is rebuilt.
  */
+size_t tl_jit_region_bytes(void)
+{
+    const char *e = getenv("HUSK_JIT_REGION_MIB");
+    long mib = e ? strtol(e, NULL, 10) : 0;
+    if (mib == 256 || mib == 512) return (size_t)mib * 1024 * 1024;
+    return TL_JIT_REGION_BYTES;
+}
+
 tl_dual_mapping *tl_find_stikdebug_prewarmed(void)
 {
     /* Ensure prewarm has been called in case this attempt ran before QEMU.
@@ -528,7 +538,7 @@ tl_dual_mapping *tl_find_stikdebug_prewarmed(void)
      * have: a smaller one leaves QEMU's tb-size carve no room. */
     bool (*prewarm_fn)(size_t) = (bool (*)(size_t))dlsym(RTLD_DEFAULT, "husk_ios_jit_prewarm");
     if (prewarm_fn) {
-        prewarm_fn(TL_JIT_REGION_BYTES);
+        prewarm_fn(tl_jit_region_bytes());
     }
 
     tl_dual_mapping *(*get_fn)(void) = (tl_dual_mapping *(*)(void))dlsym(RTLD_DEFAULT, "husk_ios_jit_get_mapping");
@@ -537,6 +547,40 @@ tl_dual_mapping *tl_find_stikdebug_prewarmed(void)
         if (is_valid_dual_mapping(m)) return m;
     }
     return NULL;
+}
+
+/*
+ * What is left of the shared region, through the JIT library's own accessor (looked up at run time, like the
+ * rest of it). SIZE_MAX when that library is not there to say.
+ */
+static size_t jit_remaining(void)
+{
+    size_t (*fn)(void) = (size_t (*)(void))dlsym(RTLD_DEFAULT, "husk_ios_jit_remaining");
+    return fn ? fn() : SIZE_MAX;
+}
+
+/*
+ * Accounting for executable memory carved for libraries. The region is a bump allocator and the slices an
+ * attempt takes are never reused by the next one: that would be safe only once no thread can still be running
+ * the old code, and nothing here can show that. The lifecycle thread is detached and husk_tl_attempt_reset waits
+ * at most a second for it before tearing down regardless; the guest's own threads (its renderer, audio, any
+ * thread it started) are neither tracked nor joined, and tearing down does not stop them. Writing
+ * a new library over pages such a thread is executing would turn a leak into memory corruption. So instead each
+ * attempt says what it took and what is left, which is what decides how many more attempts the region allows.
+ */
+static size_t g_jit_carved_ever;   /* across attempts, since the process started */
+static void jit_account(const char *name, size_t bytes)
+{
+    g_run.jit_carved += bytes;
+    g_jit_carved_ever += bytes;
+    size_t left = jit_remaining();
+    if (left == SIZE_MAX) {
+        tl_log_line("jit: %s took %zu KiB of the shared region (this attempt %zu KiB, all attempts %zu MiB)",
+                    name, bytes >> 10, g_run.jit_carved >> 10, g_jit_carved_ever >> 20);
+    } else {
+        tl_log_line("jit: %s took %zu KiB of the shared region (this attempt %zu KiB, all attempts %zu MiB, never "
+                    "given back); %zu MiB left", name, bytes >> 10, g_run.jit_carved >> 10, g_jit_carved_ever >> 20, left >> 20);
+    }
 }
 
 bool tl_jit_carve(size_t bytes, uint8_t **rx, uint8_t **rw)
@@ -1266,6 +1310,7 @@ static bool load_library(const char *name, const uint8_t *file, size_t flen)
             is_stikdebug = true;
             tl_log_line("jit: using StikDebug dual mapping (rx=%p rw=%p, %zu KiB)",
                         base, base_rw, need / 1024);
+            jit_account(name, need);
         }
     }
 
@@ -1962,6 +2007,14 @@ void husk_tl_attempt_reset(void)
     if (g_run.dex_ctx) {
         tl_dex_context_destroy(g_run.dex_ctx);
         g_run.dex_ctx = NULL;
+    }
+
+    /* Its libraries' slices of the JIT region stay taken (see jit_account): say so as the attempt goes. */
+    if (g_run.jit_carved) {
+        size_t left = jit_remaining();
+        if (left == SIZE_MAX) tl_log_line("jit: the last attempt's %zu KiB of executable memory stay taken", g_run.jit_carved >> 10);
+        else tl_log_line("jit: the last attempt's %zu KiB of executable memory stay taken; %zu MiB left for the attempts to come",
+                         g_run.jit_carved >> 10, left >> 20);
     }
 
     for (int i = 0; i < g_run.nlibs; i++) {

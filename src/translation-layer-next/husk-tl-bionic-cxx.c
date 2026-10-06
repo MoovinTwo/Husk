@@ -29,7 +29,8 @@
 static void *b_new(size_t n)
 {
     void *p = malloc(n ? n : 1);
-    if (!p) { tl_log_line("cxx: operator new(%zu) failed", n); abort(); }
+    /* Android would throw std::bad_alloc, which nothing here can throw; uncaught, it ends in abort() there too. */
+    if (!p) { tl_log_line("cxx: operator new(%zu) failed", n); tl_guest_abort_at("operator new", __builtin_return_address(0)); }
     return p;
 }
 static void *b_new_nothrow(size_t n, const void *nt) { (void)nt; return malloc(n ? n : 1); }
@@ -39,7 +40,7 @@ static void b_delete_sized(void *p, size_t n) { (void)n; free(p); }
 static void b_cxa_pure_virtual(void)
 {
     tl_log_line("cxx: pure virtual function called");
-    abort();
+    tl_guest_abort_at("__cxa_pure_virtual", __builtin_return_address(0));
 }
 
 /*

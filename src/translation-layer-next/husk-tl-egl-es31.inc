@@ -11,13 +11,106 @@ static bool g_es31_shim;
 void tl_egl_es31_shim(bool on) { g_es31_shim = on; }
 
 typedef struct { char name[72]; int binding; bool block; } es31_bind;
-#define ES31_SHADERS 1024
-#define ES31_BINDS 12
-#define ES31_ATTACHED 2048
-static struct { unsigned shader; int n; es31_bind b[ES31_BINDS]; } g_es31_sh[ES31_SHADERS];
-static struct { unsigned prog, shader; } g_es31_att[ES31_ATTACHED];
-static int g_es31_natt;
+
+/*
+ * What has to be applied at link time, keyed exactly by GL name: each shader's dropped bindings, and each program's
+ * attached shaders. Both are arrays sorted by name, under g_es31_mu. GL reuses a deleted object's name, so entries go
+ * when the object does -- a shader deleted while attached lives on in GL until it is detached or its program is
+ * deleted, and so it does here (`deleted` marks it). A program's attachments follow glAttachShader/glDetachShader, so
+ * a relink applies the bindings of exactly the shaders attached then.
+ */
+typedef struct { unsigned id; bool deleted; int n; es31_bind *b; } es31_shader;
+typedef struct { unsigned id; int n, cap; unsigned *sh; } es31_prog;
+static es31_shader *g_es31_sh; static size_t g_es31_nsh, g_es31_capsh;
+static es31_prog *g_es31_pr; static size_t g_es31_npr, g_es31_cappr;
 static pthread_mutex_t g_es31_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* Binary search of a sorted array of structs that begin with their `unsigned id`: true if found; *at is where it is or would go. */
+static bool es31_find(const void *base, size_t n, size_t esz, unsigned id, size_t *at)
+{
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        unsigned m; memcpy(&m, (const char *)base + mid * esz, sizeof(m));
+        if (m < id) lo = mid + 1; else hi = mid;
+    }
+    *at = lo;
+    if (lo == n) return false;
+    unsigned m; memcpy(&m, (const char *)base + lo * esz, sizeof(m));
+    return m == id;
+}
+
+/* Room for one more element at index `at` of a sorted array (grown as needed); false when memory runs out. */
+static bool es31_open_gap(void **base, size_t *n, size_t *cap, size_t esz, size_t at)
+{
+    if (*n == *cap) {
+        size_t c = *cap ? *cap * 2 : 64;
+        void *g = realloc(*base, c * esz);
+        if (!g) return false;
+        *base = g; *cap = c;
+    }
+    memmove((char *)*base + (at + 1) * esz, (char *)*base + at * esz, (*n - at) * esz);
+    (*n)++;
+    return true;
+}
+
+static void es31_close_gap(void *base, size_t *n, size_t esz, size_t at)
+{
+    memmove((char *)base + at * esz, (char *)base + (at + 1) * esz, (*n - at - 1) * esz);
+    (*n)--;
+}
+
+static es31_shader *es31_shader_get(unsigned sh, bool create)
+{
+    size_t at;
+    if (es31_find(g_es31_sh, g_es31_nsh, sizeof(*g_es31_sh), sh, &at)) return &g_es31_sh[at];
+    if (!create || !es31_open_gap((void **)&g_es31_sh, &g_es31_nsh, &g_es31_capsh, sizeof(*g_es31_sh), at)) return NULL;
+    g_es31_sh[at] = (es31_shader){ .id = sh };
+    return &g_es31_sh[at];
+}
+
+static es31_prog *es31_prog_get(unsigned prog, bool create)
+{
+    size_t at;
+    if (es31_find(g_es31_pr, g_es31_npr, sizeof(*g_es31_pr), prog, &at)) return &g_es31_pr[at];
+    if (!create || !es31_open_gap((void **)&g_es31_pr, &g_es31_npr, &g_es31_cappr, sizeof(*g_es31_pr), at)) return NULL;
+    g_es31_pr[at] = (es31_prog){ .id = prog };
+    return &g_es31_pr[at];
+}
+
+static bool es31_attached_anywhere(unsigned sh)
+{
+    for (size_t p = 0; p < g_es31_npr; p++)
+        for (int k = 0; k < g_es31_pr[p].n; k++) if (g_es31_pr[p].sh[k] == sh) return true;
+    return false;
+}
+
+static void es31_shader_drop(unsigned sh)
+{
+    size_t at;
+    if (!es31_find(g_es31_sh, g_es31_nsh, sizeof(*g_es31_sh), sh, &at)) return;
+    free(g_es31_sh[at].b);
+    es31_close_gap(g_es31_sh, &g_es31_nsh, sizeof(*g_es31_sh), at);
+}
+
+/* A shader GL has been asked to delete goes once nothing holds it attached, as GL's own does. */
+static void es31_shader_release(unsigned sh)
+{
+    es31_shader *e = es31_shader_get(sh, false);
+    if (e && e->deleted && !es31_attached_anywhere(sh)) es31_shader_drop(sh);
+}
+
+/* One more binding record in a growing array; NULL when memory runs out. */
+static es31_bind *es31_push(es31_bind **rec, int *n, int *cap)
+{
+    if (*n == *cap) {
+        int c = *cap ? *cap * 2 : 8;
+        es31_bind *g = realloc(*rec, (size_t)c * sizeof(*g));
+        if (!g) return NULL;
+        *rec = g; *cap = c;
+    }
+    return &(*rec)[(*n)++];
+}
 
 /* "OpenGL ES 3.0 ..." -> "OpenGL ES 3.1 ...", "OpenGL ES GLSL ES 3.00 ..." -> "... 3.10 ..." (a copy: the driver's string is not ours to edit) */
 static const char *es31_fix(const char *s, bool glsl)
@@ -32,11 +125,19 @@ static const char *es31_fix(const char *s, bool glsl)
 
 static bool es31_ident(int c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; }
 
-/* The 300 es text of a 310 es shader (malloc'd), with the bindings it dropped in rec[0..*nrec). Anything else is returned as it came. */
-static char *es31_downgrade(const char *src, size_t n, es31_bind *rec, int *nrec)
+/*
+ * The 300 es text of a 310 es shader (malloc'd), with the bindings it dropped in (*rec)[0..*nrec) (malloc'd, the
+ * caller's to free). Anything else is returned as it came. NULL when memory runs out.
+ *
+ * The output is at most three times the input: "[]" becomes "[1024]", and a storage block's new header is at most
+ * three bytes longer than the shortest one it can replace ("layout(binding)buffer N{"), which is itself 22 bytes or more.
+ */
+static char *es31_downgrade(const char *src, size_t n, es31_bind **rec, int *nrec)
 {
-    char *out = malloc(n + 4096); size_t o = 0;
-    *nrec = 0;
+    char *out = malloc(n * 3 + 4096); size_t o = 0;
+    int cap = 0;
+    *rec = NULL; *nrec = 0;
+    if (!out) return NULL;
     const char *ver = strstr(src, "#version 310 es");
     if (!ver) { memcpy(out, src, n); out[n] = 0; return out; }
     for (size_t i = 0; i < n;) {
@@ -61,8 +162,9 @@ static char *es31_downgrade(const char *src, size_t n, es31_bind *rec, int *nrec
                 size_t e = dl;
                 while (e && (decl[e - 1] == ' ' || decl[e - 1] == '\n' || decl[e - 1] == '\t' || decl[e - 1] == '\r')) e--;
                 size_t st = e; while (st && es31_ident(decl[st - 1])) st--;
-                if (close < n && val >= 0 && e > st && e - st < sizeof(rec[0].name) && *nrec < ES31_BINDS) {
-                    memcpy(rec[*nrec].name, decl + st, e - st); rec[*nrec].name[e - st] = 0; rec[*nrec].binding = val; rec[*nrec].block = true; (*nrec)++;
+                es31_bind *r;
+                if (close < n && val >= 0 && e > st && e - st < sizeof(r->name) && (r = es31_push(rec, nrec, &cap))) {
+                    memcpy(r->name, decl + st, e - st); r->name[e - st] = 0; r->binding = val; r->block = true;
                     o += (size_t)sprintf(out + o, "layout(std140) uniform %.*s\n{", (int)(e - st), decl + st);
                     for (size_t k = d + 1; k < close; k++) {
                         if (src[k] == '[' && k + 1 < close && src[k + 1] == ']') { o += (size_t)sprintf(out + o, "[1024]"); k++; }
@@ -75,14 +177,15 @@ static char *es31_downgrade(const char *src, size_t n, es31_bind *rec, int *nrec
             if (b && !opaque && !ssbo) {
                 char *eq = strchr(b, '='); int val = eq ? atoi(eq + 1) : -1;
                 bool block = d < n && src[d] == '{';
-                if (*nrec < ES31_BINDS && val >= 0) {
+                if (val >= 0) {
                     size_t e = dl;
                     while (e && (decl[e - 1] == ' ' || decl[e - 1] == '\n' || decl[e - 1] == '\t' || decl[e - 1] == '\r')) e--;
                     while (e && decl[e - 1] == ']') { while (e && decl[e - 1] != '[') e--; if (e) e--; }
                     size_t st = e; while (st && es31_ident(decl[st - 1])) st--;
-                    if (e > st && e - st < sizeof(rec[0].name)) {
-                        memcpy(rec[*nrec].name, decl + st, e - st); rec[*nrec].name[e - st] = 0;
-                        rec[*nrec].binding = val; rec[*nrec].block = block; (*nrec)++;
+                    es31_bind *r;
+                    if (e > st && e - st < sizeof(r->name) && (r = es31_push(rec, nrec, &cap))) {
+                        memcpy(r->name, decl + st, e - st); r->name[e - st] = 0;
+                        r->binding = val; r->block = block;
                     }
                 }
                 /* the layout again, without the binding qualifier */
@@ -112,14 +215,17 @@ static void w_glShaderSource(unsigned sh, int count, const char *const *str, con
     size_t total = 0;
     for (int i = 0; i < count; i++) total += str[i] ? (len && len[i] >= 0 ? (size_t)len[i] : strlen(str[i])) : 0;
     char *cat = malloc(total + 1); size_t k = 0;
+    if (!cat) { r_glShaderSource(sh, count, str, len); return; }
     for (int i = 0; i < count; i++) if (str[i]) { size_t l = len && len[i] >= 0 ? (size_t)len[i] : strlen(str[i]); memcpy(cat + k, str[i], l); k += l; }
     cat[k] = 0;
-    es31_bind rec[ES31_BINDS]; int nrec = 0;
-    char *down = es31_downgrade(cat, k, rec, &nrec);
+    es31_bind *rec = NULL; int nrec = 0;
+    char *down = es31_downgrade(cat, k, &rec, &nrec);
+    if (!down) { free(rec); free(cat); r_glShaderSource(sh, count, str, len); return; }
     pthread_mutex_lock(&g_es31_mu);
-    int slot = (int)(sh % ES31_SHADERS);
-    g_es31_sh[slot].shader = sh; g_es31_sh[slot].n = nrec; memcpy(g_es31_sh[slot].b, rec, sizeof(es31_bind) * (size_t)nrec);
+    es31_shader *e = es31_shader_get(sh, true);
+    if (e) { free(e->b); e->b = rec; e->n = nrec; rec = NULL; }
     pthread_mutex_unlock(&g_es31_mu);
+    free(rec);
     const char *one = down; int one_len = (int)strlen(down);
     r_glShaderSource(sh, 1, &one, &one_len);
     free(cat); free(down);
@@ -131,7 +237,55 @@ static void w_glAttachShader(unsigned prog, unsigned sh)
     r_glAttachShader(prog, sh);
     if (!g_es31_shim) return;
     pthread_mutex_lock(&g_es31_mu);
-    g_es31_att[g_es31_natt % ES31_ATTACHED].prog = prog; g_es31_att[g_es31_natt % ES31_ATTACHED].shader = sh; g_es31_natt++;
+    es31_prog *p = es31_prog_get(prog, true);
+    bool have = false;
+    for (int k = 0; p && k < p->n; k++) if (p->sh[k] == sh) have = true;
+    if (p && !have) {
+        if (p->n == p->cap) {
+            int c = p->cap ? p->cap * 2 : 4;
+            unsigned *g = realloc(p->sh, (size_t)c * sizeof(*g));
+            if (g) { p->sh = g; p->cap = c; }
+        }
+        if (p->n < p->cap) p->sh[p->n++] = sh;
+    }
+    pthread_mutex_unlock(&g_es31_mu);
+}
+
+static void (*r_glDetachShader)(unsigned, unsigned);
+static void w_glDetachShader(unsigned prog, unsigned sh)
+{
+    r_glDetachShader(prog, sh);
+    pthread_mutex_lock(&g_es31_mu);
+    es31_prog *p = es31_prog_get(prog, false);
+    for (int k = 0; p && k < p->n; k++) if (p->sh[k] == sh) { p->sh[k] = p->sh[--p->n]; break; }
+    es31_shader_release(sh);
+    pthread_mutex_unlock(&g_es31_mu);
+}
+
+static void (*r_glDeleteShader)(unsigned);
+static void w_glDeleteShader(unsigned sh)
+{
+    r_glDeleteShader(sh);
+    if (!sh) return;
+    pthread_mutex_lock(&g_es31_mu);
+    es31_shader *e = es31_shader_get(sh, false);
+    if (e) { e->deleted = true; es31_shader_release(sh); }
+    pthread_mutex_unlock(&g_es31_mu);
+}
+
+static void (*r_glDeleteProgram)(unsigned);
+static void w_glDeleteProgram(unsigned prog)
+{
+    r_glDeleteProgram(prog);
+    if (!prog) return;
+    pthread_mutex_lock(&g_es31_mu);
+    size_t at;
+    if (es31_find(g_es31_pr, g_es31_npr, sizeof(*g_es31_pr), prog, &at)) {
+        unsigned *sh = g_es31_pr[at].sh; int n = g_es31_pr[at].n;
+        es31_close_gap(g_es31_pr, &g_es31_npr, sizeof(*g_es31_pr), at);
+        for (int k = 0; k < n; k++) es31_shader_release(sh[k]);   /* its shaders are detached with it */
+        free(sh);
+    }
     pthread_mutex_unlock(&g_es31_mu);
 }
 
@@ -153,14 +307,11 @@ static void w_glLinkProgram(unsigned prog)
     int cur = 0; a_glGetIntegerv(0x8B8D /* GL_CURRENT_PROGRAM */, &cur);
     bool used = false;
     pthread_mutex_lock(&g_es31_mu);
-    int total = g_es31_natt < ES31_ATTACHED ? g_es31_natt : ES31_ATTACHED;
-    for (int a = 0; a < total; a++) {
-        if (g_es31_att[a].prog != prog) continue;
-        unsigned sh = g_es31_att[a].shader;
-        int slot = (int)(sh % ES31_SHADERS);
-        if (g_es31_sh[slot].shader != sh) continue;
-        for (int b = 0; b < g_es31_sh[slot].n; b++) {
-            const es31_bind *e = &g_es31_sh[slot].b[b];
+    es31_prog *p = es31_prog_get(prog, false);
+    for (int a = 0; p && a < p->n; a++) {
+        es31_shader *s = es31_shader_get(p->sh[a], false);
+        for (int b = 0; s && b < s->n; b++) {
+            const es31_bind *e = &s->b[b];
             if (e->block) { unsigned idx = getblk(prog, e->name); if (idx != 0xFFFFFFFFu) blkbind(prog, idx, (unsigned)e->binding); }
             else { int loc = getloc(prog, e->name); if (loc >= 0) { if (!used) { useprog(prog); used = true; } uni1i(loc, e->binding); } }
         }
@@ -190,10 +341,10 @@ static void w_glBindBufferBase(unsigned target, unsigned index, unsigned buffer)
     es31_note_storage("glBindBufferBase", target);
     if (g_es31_shim && target == 0x90D2 /* GL_SHADER_STORAGE_BUFFER */) {
         static void (*getparam)(unsigned, unsigned, int *), (*bindbuf)(unsigned, unsigned), (*bufdata)(unsigned, long, const void *, unsigned),
-                    (*copysub)(unsigned, unsigned, long, long, long), (*getsub)(unsigned, long, long, void *), (*subdata)(unsigned, long, long, const void *);
+                    (*copysub)(unsigned, unsigned, long, long, long), (*subdata)(unsigned, long, long, const void *);
         if (!getparam && a_eglGetProcAddress) {
             getparam = a_eglGetProcAddress("glGetBufferParameteriv"); bindbuf = a_eglGetProcAddress("glBindBuffer");
-            bufdata = a_eglGetProcAddress("glBufferData"); getsub = a_eglGetProcAddress("glGetBufferSubData"); subdata = a_eglGetProcAddress("glBufferSubData");
+            bufdata = a_eglGetProcAddress("glBufferData"); subdata = a_eglGetProcAddress("glBufferSubData");
             copysub = a_eglGetProcAddress("glCopyBufferSubData");
         }
         if (getparam && bindbuf && bufdata && subdata && copysub && buffer) {

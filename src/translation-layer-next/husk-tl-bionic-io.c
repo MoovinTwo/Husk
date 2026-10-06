@@ -9,6 +9,7 @@
  */
 #define _DARWIN_C_SOURCE
 #include "husk-tl-bionic.h"
+#include "husk-tl-guest.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -168,7 +169,7 @@ static long b_read(int fd, void *p, size_t n)
 }
 static long b___read_chk(int fd, void *p, size_t n, size_t bufsz)
 {
-    if (n > bufsz) { tl_log_line("bionic: __read_chk overflow"); abort(); }
+    if (n > bufsz) { tl_log_line("bionic: __read_chk: %zu bytes into a %zu-byte buffer", n, bufsz); tl_guest_abort_at("__read_chk", __builtin_return_address(0)); }
     return b_read(fd, p, n);
 }
 static long b_write(int fd, const void *p, size_t n)
@@ -790,18 +791,41 @@ static long futex_call(uint32_t *addr, int op, uint32_t val, const struct timesp
     return -38;
 }
 
-static long linux_syscall_impl(long a0, long a1, long a2, long a3, long a4, long a5, long nr);
+static long linux_syscall_impl(long a0, long a1, long a2, long a3, long a4, long a5, long nr, void *lr);
+static long sys_path(long nr, long a0, long a1, long a2, long a3, long a4);
 long tl_linux_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long nr)
 {
     static int trace = -1;
     if (trace < 0) trace = getenv("TL_SYSCALL_TRACE") ? 1 : 0;
-    long r = linux_syscall_impl(a0, a1, a2, a3, a4, a5, nr);
+    /* Who made the call, for the log of a guest that ends itself: syscall()'s wrapper, or the svc stub's return. */
+    long r = linux_syscall_impl(a0, a1, a2, a3, a4, a5, nr, __builtin_return_address(0));
     if (trace) tl_log_line("syscall %ld(%#lx, %#lx, %#lx) -> %ld", nr, a0, a1, a2, r);
     return r;
 }
-static long linux_syscall_impl(long a0, long a1, long a2, long a3, long a4, long a5, long nr)
+/*
+ * kill(2), tkill(2) and tgkill(2) with SIGABRT or SIGKILL on its own process is the guest ending itself, as abort()
+ * is: Linux would take the whole process down whichever of its threads the signal names. Anything else is raised on
+ * the calling thread, as it was.
+ */
+static long sys_kill(long nr, long a0, long a1, long a2, void *lr)
 {
-    (void)a4; (void)a5;
+    int sig = nr == 131 ? (int)a2 : (int)a1;
+    if (sig == 0) return 0;
+    note_signal("kill/tgkill system call", sig);
+    bool self = nr == 130 || (nr == 129 && (a0 == getpid() || a0 == 0)) || (nr == 131 && a0 == getpid());
+    if (self && (sig == 6 || sig == 9)) {
+        char what[64];
+        snprintf(what, sizeof(what), "%s(self, %d) by raw system call", nr == 129 ? "kill" : nr == 130 ? "tkill" : "tgkill", sig);
+        tl_guest_fatal(128 + sig, what, lr);
+    }
+    int d = tl_signal_to_darwin(sig);
+    if (d < 0) return -22;
+    return raise(d) == 0 ? 0 : -3;
+}
+
+static long linux_syscall_impl(long a0, long a1, long a2, long a3, long a4, long a5, long nr, void *lr)
+{
+    (void)a5;
     switch (nr) {
     case 178: { uint64_t t = 0; pthread_threadid_np(NULL, &t); return (long)t; }       /* gettid */
     case 172: return getpid();
@@ -809,25 +833,24 @@ static long linux_syscall_impl(long a0, long a1, long a2, long a3, long a4, long
     case 174: case 175: return getuid();
     case 176: case 177: return getgid();
     case 98:  return futex_call((uint32_t *)a0, (int)a1, (uint32_t)a2, (const struct timespec *)a3, (uint32_t)a5);
-    case 129: case 130: case 131: {                                                     /* kill, tkill, tgkill */
-        int sig = nr == 131 ? (int)a2 : (int)a1;
-        if (sig == 0) return 0;
-        note_signal("kill/tgkill system call", sig);
-        int d = tl_signal_to_darwin(sig);
-        if (d < 0) return -22;
-        return raise(d) == 0 ? 0 : -3;
-    }
-    case 56: {                                                                          /* openat: only AT_FDCWD */
-        if ((int)a0 != -100) return -38;
-        int fd = b_open((const char *)a1, (int)a2, (unsigned)a3);
-        return fd < 0 ? -*tl_guest_errno_ptr() : fd;
-    }
+    case 129: case 130: case 131: return sys_kill(nr, a0, a1, a2, lr);                 /* kill, tkill, tgkill */
+    /* Every call that takes a path goes through the same confinement as the libc wrappers (sys_path). */
+    case 17: case 34: case 35: case 36: case 37: case 38: case 43: case 45: case 48: case 49: case 53: case 56:
+    case 78: case 79: case 88: case 276: case 439:
+        return sys_path(nr, a0, a1, a2, a3, a4);
     case 57: { int r = close((int)a0); return r < 0 ? -tl_errno_to_guest(errno) : r; }
     case 63: { long r = read((int)a0, (void *)a1, (size_t)a2); return r < 0 ? -tl_errno_to_guest(errno) : r; }
     case 64: { long r = write((int)a0, (const void *)a1, (size_t)a2); return r < 0 ? -tl_errno_to_guest(errno) : r; }
     case 113: { int r = clock_gettime(clock_to_darwin((int)a0), (struct timespec *)a1); return r < 0 ? -tl_errno_to_guest(errno) : 0; }
     case 169: return b_gettimeofday((int64_t *)a0, (void *)a1);
-    case 93: case 94: tl_log_line("bionic: exit(%ld) by raw system call", a0); exit((int)a0);
+    case 93:                                                                            /* exit: the calling thread only */
+        /* On a thread the guest started that is the thread's end, as on Linux. Anywhere else nothing of the
+         * guest's own is left to end but the game. */
+        if (tl_guest_thread_marked()) { tl_log_line("bionic: thread exit(%ld) by raw system call", a0); pthread_exit(NULL); }
+        /* fall through */
+    case 94:                                                                            /* exit_group */
+        tl_guest_fatal((int)a0, nr == 93 ? "exit by raw system call" : "exit_group by raw system call", lr);
+        exit((int)a0);
     case 278: arc4random_buf((void *)a0, (size_t)a1); return a1;                        /* getrandom */
     case 283: return 0;                                                                 /* membarrier */
     case 134: case 135: return 0;                                                       /* rt_sigaction, rt_sigprocmask: accepted */
@@ -860,12 +883,12 @@ static int b_select(int n, fd_set *r, fd_set *w, fd_set *e, struct timeval *tv)
 }
 static void b___FD_SET_chk(int fd, uint64_t *set, size_t size)
 {
-    if (fd < 0 || (size_t)fd >= size * 8) { tl_log_line("bionic: __FD_SET_chk: fd %d out of range", fd); abort(); }
+    if (fd < 0 || (size_t)fd >= size * 8) { tl_log_line("bionic: __FD_SET_chk: fd %d out of range", fd); tl_guest_abort_at("__FD_SET_chk", __builtin_return_address(0)); }
     set[fd / 64] |= 1ull << (fd % 64);
 }
 static int b___FD_ISSET_chk(int fd, const uint64_t *set, size_t size)
 {
-    if (fd < 0 || (size_t)fd >= size * 8) { tl_log_line("bionic: __FD_ISSET_chk: fd %d out of range", fd); abort(); }
+    if (fd < 0 || (size_t)fd >= size * 8) { tl_log_line("bionic: __FD_ISSET_chk: fd %d out of range", fd); tl_guest_abort_at("__FD_ISSET_chk", __builtin_return_address(0)); }
     return (set[fd / 64] >> (fd % 64)) & 1;
 }
 static void *b___cmsg_nxthdr(void *msg, void *cmsg) { (void)msg; (void)cmsg; return NULL; }
@@ -975,6 +998,87 @@ static long b_pathconf(const char *p, int name)
 {
     (void)p;
     switch (name) { case 3: return 255; case 4: return 4096; case 5: return 4096; case 6: return 0x10000; default: return -1; }
+}
+
+/*
+ * Raw system calls that name a path: getcwd, mkdirat, unlinkat, symlinkat, linkat, renameat(2), statfs, truncate,
+ * faccessat(2), chdir, fchmodat, openat, readlinkat, newfstatat, utimensat. They were ENOSYS (openat alone was
+ * answered, for AT_FDCWD only) because answering them with Darwin's own calls would hand the kernel paths nothing
+ * had checked; they are answered by the libc wrappers above, which confine every path (tl_path_at for a directory
+ * descriptor, then tl_path_confine), and the wrapper's -1 and errno become the system call's -errno.
+ */
+#define G_AT_EMPTY_PATH 0x1000
+static int sys_fstatat(int dirfd, const char *path, guest_stat *st, int flags)
+{
+    if ((flags & G_AT_EMPTY_PATH) && path && !path[0]) return b_fstat(dirfd, st);
+    char b[PATH_MAX]; const char *p = tl_path_at(dirfd, path, b, sizeof(b));
+    if (!p) return -1;
+    return (flags & G_AT_SYMLINK_NOFOLLOW) ? b_lstat(p, st) : b_stat(p, st);
+}
+static int sys_renameat(int od, const char *op, int nd, const char *np, unsigned flags)
+{
+    char a[PATH_MAX], b[PATH_MAX], x[PATH_MAX], y[PATH_MAX];
+    const char *p = tl_path_at(od, op, a, sizeof(a)), *q = p ? tl_path_at(nd, np, b, sizeof(b)) : NULL;
+    if (!q || !tl_path_confine(p, TL_PATH_WRITE | TL_PATH_NOFOLLOW, x, sizeof(x)) || !tl_path_confine(q, TL_PATH_WRITE | TL_PATH_NOFOLLOW, y, sizeof(y))) return -1;
+    if (flags & ~1u) { tl_set_guest_errno(22); return -1; }          /* RENAME_EXCHANGE, RENAME_WHITEOUT: not provided */
+    TL_ERRNO_BEGIN();
+    int r = flags ? renamex_np(x, y, RENAME_EXCL) : rename(x, y);      /* RENAME_NOREPLACE */
+    TL_ERRNO_END();
+    return r;
+}
+static long sys_path_call(long nr, long a0, long a1, long a2, long a3, long a4)
+{
+    char b[PATH_MAX], c[PATH_MAX];
+    const char *p, *q;
+    int dfd = (int)a0;
+    switch (nr) {
+    case 17: {                                                        /* getcwd: the length, terminator included */
+        if (!a0) { tl_set_guest_errno(14); return -1; }
+        char *r = tl_path_getcwd((char *)a0, (size_t)a1);
+        return r ? (long)strlen(r) + 1 : -1;
+    }
+    case 34: p = tl_path_at(dfd, (const char *)a1, b, sizeof(b)); return p ? b_mkdir(p, (unsigned)a2) : -1;
+    case 35: return b_unlinkat(dfd, (const char *)a1, (int)a2);
+    case 36: p = tl_path_at((int)a1, (const char *)a2, b, sizeof(b)); return p ? b_symlink((const char *)a0, p) : -1;
+    case 37:                                                          /* linkat: the flags (AT_SYMLINK_FOLLOW) are not honoured */
+        p = tl_path_at(dfd, (const char *)a1, b, sizeof(b));
+        q = p ? tl_path_at((int)a2, (const char *)a3, c, sizeof(c)) : NULL;
+        return q ? b_link(p, q) : -1;
+    case 38: return sys_renameat(dfd, (const char *)a1, (int)a2, (const char *)a3, 0);
+    case 276: return sys_renameat(dfd, (const char *)a1, (int)a2, (const char *)a3, (unsigned)a4);
+    case 43: return b_statfs((const char *)a0, (guest_statfs *)a1);
+    case 45: return b_truncate((const char *)a0, a1);
+    case 48: case 439:                                                /* faccessat(2): AT_EACCESS and AT_SYMLINK_NOFOLLOW are not honoured */
+        p = tl_path_at(dfd, (const char *)a1, b, sizeof(b)); return p ? b_access(p, (int)a2) : -1;
+    case 49: return b_chdir((const char *)a0);
+    case 53: return b_fchmodat(dfd, (const char *)a1, (unsigned)a2, 0);
+    case 56: return b_openat(dfd, (const char *)a1, (int)a2, (unsigned)a3);
+    case 78: p = tl_path_at(dfd, (const char *)a1, b, sizeof(b)); return p ? b_readlink(p, (char *)a2, (size_t)a3) : -1;
+    case 79: return sys_fstatat(dfd, (const char *)a1, (guest_stat *)a2, (int)a3);
+    case 88:
+        if (!a1) {                                                    /* no path: the descriptor itself, as futimens */
+            const struct timespec *ts = (const struct timespec *)a2;
+            struct timespec d[2];
+            if (ts) for (int i = 0; i < 2; i++) {
+                d[i] = ts[i];
+                if (ts[i].tv_nsec == 0x3fffffff) d[i].tv_nsec = UTIME_NOW; else if (ts[i].tv_nsec == 0x3ffffffe) d[i].tv_nsec = UTIME_OMIT;
+            }
+            TL_ERRNO_BEGIN(); int r = futimens(dfd, ts ? d : NULL); TL_ERRNO_END(); return r;
+        }
+        return b_utimensat(dfd, (const char *)a1, (const struct timespec *)a2, (int)a3);
+    }
+    tl_set_guest_errno(38);
+    return -1;
+}
+static long sys_path(long nr, long a0, long a1, long a2, long a3, long a4)
+{
+    /* A raw system call reports its error in its result and leaves errno alone, which the wrappers do not. */
+    int *ep = tl_guest_errno_ptr(), saved = *ep;
+    *ep = 0;
+    long r = sys_path_call(nr, a0, a1, a2, a3, a4);
+    if (r < 0) r = *ep ? -(long)*ep : -5 /* EIO: a failure that named no cause */;
+    *ep = saved;
+    return r;
 }
 
 const tl_bionic_entry tl_tab_io2[] = {

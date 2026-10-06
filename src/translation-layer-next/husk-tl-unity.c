@@ -69,15 +69,16 @@ bool tl_unity_start(const tl_unity_config *cfg)
     tl_ld_init(main_lib);
     onload_fn onload = (onload_fn)tl_ld_sym(main_lib, "JNI_OnLoad");
     if (!onload) { tl_log_line("unity: libmain.so has no JNI_OnLoad"); return false; }
-    int32_t ver;
+    int32_t ver = 0;
     TL_JNI_NATIVE_CALL(ver = onload(tl_jni_vm(), NULL));
+    if (tl_guest_ended()) return false;
     tl_log_line("unity: libmain JNI_OnLoad -> %#x", ver);
     if (tl_jni_pending()) { tl_log_line("unity: an exception is pending after libmain's JNI_OnLoad"); return false; }
 
     typedef uint8_t (*load_fn)(void *env, void *cls, void *dir);
     load_fn load = (load_fn)native_of("com/unity3d/player/NativeLoader", "load", "(Ljava/lang/String;)Z");
     if (!load) return false;
-    uint8_t ok;
+    uint8_t ok = 0;
     TL_JNI_NATIVE_CALL(ok = load(tl_jni_env(), tl_jni_class_object("com/unity3d/player/NativeLoader"), tl_jni_local(tl_jni_new_string("/data/app/lib/arm64"))));
     tl_log_line("unity: NativeLoader.load -> %d", ok);
     return ok != 0;
@@ -118,7 +119,8 @@ static void *unity_main(void *arg)
 
     void *render = native_of("com/unity3d/player/UnityPlayer", "nativeRender", "()Z");
     bool was_paused = false;
-    while (render && !atomic_load(&U.stop)) {
+    /* The engine's own end (nativeRender false) or the game's exit (tl_guest_ended, from any thread) stops the loop. */
+    while (render && !atomic_load(&U.stop) && !tl_guest_ended()) {
         if (atomic_load(&U.paused)) {
             if (!was_paused) { NATIVE_VOID("nativeFocusChanged", "(Z)V", 0, 0); NATIVE_VOID("nativePause", "()Z", 0, 0); was_paused = true; tl_log_line("unity: paused"); }
             usleep(20000);
@@ -127,9 +129,10 @@ static void *unity_main(void *arg)
         if (was_paused) { NATIVE_VOID("nativeResume", "()V", 0, 0); NATIVE_VOID("nativeFocusChanged", "(Z)V", 1, 0); was_paused = false; tl_log_line("unity: resumed"); }
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
-        uint8_t keep;
+        uint8_t keep = 1;
         /* Each frame is a native call, whose locals go when it returns: the engine leaves most of them to that. */
         TL_JNI_NATIVE_CALL(keep = ((uint8_t (*)(void *, void *))render)(tl_jni_env(), U.player));
+        if (tl_guest_ended()) break;
         clock_gettime(CLOCK_MONOTONIC, &t1);
         {
             unsigned long long ns = (unsigned long long)((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec));

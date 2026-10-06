@@ -15,11 +15,15 @@ iPhone from Settings with no computer. The app walks you through it; see
 
 ## Builds
 
-Every push builds an unsigned `Husk.ipa` in GitHub Actions
-([build-ipa.yml](.github/workflows/build-ipa.yml)). It is attached to the run
-as an artifact, ready for AltStore, SideStore or TrollStore to sign and
-install. The first run builds QEMU and its dependencies from scratch, which
-takes a couple of hours; after that they are cached.
+The IPA is built locally on a Mac with Xcode: `./scripts/ci_build.sh
+[output.ipa]` fetches the pinned, checksum-verified sources, builds QEMU and
+its dependencies, ANGLE and the GPU stack, and packages an unsigned
+`Husk.ipa` for AltStore, SideStore or TrollStore to sign and install. The
+first run builds everything from scratch, which takes a couple of hours.
+
+GitHub Actions ([tests.yml](.github/workflows/tests.yml)) runs the host-side
+tests in `tests/translation-layer/run.sh` on every push and pull request; it
+does not build the IPA.
 
 ## Licence
 

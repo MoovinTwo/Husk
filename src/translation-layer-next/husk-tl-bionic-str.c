@@ -156,14 +156,14 @@ static int b_vsnprintf(char *s, size_t n, const char *fmt, tl_va_list *ap) { ret
 static int b___vsnprintf_chk(char *s, size_t n, int flag, size_t slen, const char *fmt, tl_va_list *ap)
 {
     (void)flag;
-    if (n > slen) { tl_log_line("bionic: __vsnprintf_chk: buffer %zu smaller than limit %zu", slen, n); abort(); }
+    if (n > slen) { tl_log_line("bionic: __vsnprintf_chk: buffer %zu smaller than limit %zu", slen, n); tl_guest_abort_at("__vsnprintf_chk", __builtin_return_address(0)); }
     return tl_format(s, n, fmt, ap);
 }
 static int b___vsprintf_chk(char *s, int flag, size_t slen, const char *fmt, tl_va_list *ap)
 {
     (void)flag;
     int n = tl_format(s, slen ? slen : (size_t)0x7fffffff, fmt, ap);
-    if (slen && (size_t)n >= slen) { tl_log_line("bionic: __vsprintf_chk overflow"); abort(); }
+    if (slen && (size_t)n >= slen) { tl_log_line("bionic: __vsprintf_chk overflow"); tl_guest_abort_at("__vsprintf_chk", __builtin_return_address(0)); }
     return n;
 }
 static int b_vprintf(const char *fmt, tl_va_list *ap)
@@ -274,7 +274,8 @@ static int b_rename(const char *a, const char *b)
 
 /* ----------------------------------------------------------- _chk variants */
 
-static void chk_fail(const char *what) { tl_log_line("bionic: %s: buffer overflow detected", what); abort(); }
+/* A macro, so that the caller named in the log is the guest code that called the *_chk function. */
+#define chk_fail(what) do { tl_log_line("bionic: %s: buffer overflow detected", what); tl_guest_abort_at(what, __builtin_return_address(0)); } while (0)
 static void *b___memcpy_chk(void *d, const void *s, size_t n, size_t dl) { if (n > dl) chk_fail("__memcpy_chk"); return memcpy(d, s, n); }
 static void *b___memmove_chk(void *d, const void *s, size_t n, size_t dl) { if (n > dl) chk_fail("__memmove_chk"); return memmove(d, s, n); }
 static void *b___memset_chk(void *d, int c, size_t n, size_t dl) { if (n > dl) chk_fail("__memset_chk"); return memset(d, c, n); }

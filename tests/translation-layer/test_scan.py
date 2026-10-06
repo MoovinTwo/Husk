@@ -66,7 +66,23 @@ x86 = build("libx86.so", "plain.c", target="x86_64-linux-android29")
 
 
 def readelf_relocs(lib):
-    return len(re.findall(r"R_AARCH64_\w+", sh("llvm-readelf", "-r", lib)))
+    # Older llvm-readelf printed one R_AARCH64_RELATIVE line per packed RELR
+    # relocation. Newer ones (LLVM 23) print the packed entries and their
+    # decoded addresses instead -- one line per relocation, no type name -- so
+    # count those lines when the section has no type names.
+    out = sh("llvm-readelf", "-r", lib)
+    n = len(re.findall(r"R_AARCH64_\w+", out))
+    section = ""
+    relr_lines = {}
+    for line in out.splitlines():
+        if line.startswith("Relocation section"):
+            section = line
+        elif ".relr." in section and line.strip() and not line.startswith("Index:"):
+            relr_lines.setdefault(section, []).append(line)
+    for lines in relr_lines.values():
+        if not any("R_AARCH64_" in l for l in lines):
+            n += len(lines)
+    return n
 
 
 def readelf_imports(lib):

@@ -185,7 +185,7 @@ struct AppDetailView: View {
         DispatchQueue.global(qos: .userInitiated).async {
             _ = try? GuestBridge.shared.shell(
                 "am start -a android.settings.APPLICATION_DETAILS_SETTINGS "
-              + "-d package:\(pkg)", timeout: 30)
+              + "-d \(AndroidHost.quote("package:" + pkg))", timeout: 30)
         }
         onOpenGuest()
     }
