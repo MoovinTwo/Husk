@@ -34,15 +34,16 @@ enum JITBootstrap {
     /// Without this, a `brk` that StikDebug is not there to service is a fatal
     /// SIGTRAP rather than a failed call — the process simply dies.
     static func installTrapGuard() {
+        publishRegionSize()
         HuskLog.log("jit", "installing brk trap guard")
         husk_ios_jit_install_trap_handler()
         HuskLog.log("jit", "trap guard installed -- an unserviced brk will now "
                          + "return 0 instead of killing the process")
     }
 
-    /// Size QEMU will ask for. Must match tb-size in the phase 1 command line:
-    /// a smaller region here means QEMU allocates a second one, at a point where
-    /// StikDebug may be long gone.
+    /// Size of the region QEMU and the native runtime share. Must be at least
+    /// tb-size in the phase 1 command line: a smaller region here means QEMU
+    /// allocates a second one, at a point where StikDebug may be long gone.
     // Back to 256 MiB. Raising this to 512 was one of three changes made at
     // once in v15, and v15 was the first build to die inside qemu_init(). The
     // guest RAM -- the other suspect -- has since been shown to map and write
@@ -75,6 +76,12 @@ enum JITBootstrap {
         return jitRegionChoices.contains(stored) ? stored : defaultJITRegionMiB
     }
 
+    /// Tell the translation layer (plain C, no UserDefaults) the configured size, so its own
+    /// prewarm, when it gets there first, claims the same region. Prewarm is one-shot.
+    static func publishRegionSize() {
+        setenv("HUSK_JIT_REGION_MIB", String(jitRegionMiB), 1)
+    }
+
     /// True once the region is held. The memory budget needs this: after a
     /// prewarm the JIT is already counted in the footprint, so subtracting it
     /// again charges for it twice and cost the guest 256 MiB.
@@ -100,6 +107,7 @@ enum JITBootstrap {
             HuskLog.log("jit", "the region is no larger than QEMU's tb-size (\(QemuRunner.jitMiB) MiB): "
                              + "if Android starts first, native games get no JIT memory until Husk is relaunched")
         }
+        publishRegionSize()
         let ok = husk_ios_jit_prewarm(jitBytes)
         if ok {
             prewarmed = true
